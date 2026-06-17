@@ -16,21 +16,21 @@ Requires `tmux`, `claude` (logged in), and `systemd --user` (for the timer).
 
 ## Invoking the CLI
 
-`csk` is on PATH when installed as a plugin (Claude Code auto-adds `bin/`). Otherwise call
-`./bin/csk` from this repo, or `"$CLAUDE_PLUGIN_ROOT/bin/csk"`. Self-contained bash — no build.
+`claude-keep` is on PATH when installed as a plugin (Claude Code auto-adds `bin/`). Otherwise call
+`./bin/claude-keep` from this repo, or `"$CLAUDE_PLUGIN_ROOT/bin/claude-keep"`. Self-contained bash — no build.
 
 ## Cheat sheet
 
 ```bash
-csk add [--no-rc] [--effort <e>]   # register THIS session (reads its own env)
-csk rm [name]                      # remove THIS session, or a named one
-csk ls                             # list registry + who's live
-csk restore                        # re-launch everything that's down (idempotent)
-csk install-timer [--interval M]   # systemd --user timer → restore (default 5 min)
-csk uninstall-timer
+claude-keep add [--no-rc] [--effort <e>]   # register THIS session (reads its own env)
+claude-keep rm [name]                      # remove THIS session, or a named one
+claude-keep ls                             # list registry + who's live
+claude-keep restore                        # re-launch everything that's down (idempotent)
+claude-keep install-timer [--interval M]   # systemd --user timer → restore (default 5 min)
+claude-keep uninstall-timer
 ```
 
-`csk add` reads the calling session's identity from its env: `$CLAUDE_CODE_SESSION_ID`
+`claude-keep add` reads the calling session's identity from its env: `$CLAUDE_CODE_SESSION_ID`
 (uuid), `tmux display-message` (name), `$PWD` (cwd), `$CLAUDE_EFFORT`. Run it **inside**
 the session you want to keep. Model isn't stored — `claude --resume` restores it.
 

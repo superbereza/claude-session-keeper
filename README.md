@@ -22,25 +22,25 @@ This tool keeps a small registry of which sessions matter and brings them back a
 /plugin install claude-session-keeper@claude-session-keeper
 ```
 
-The `csk` CLI is auto-added to PATH while the plugin is enabled. Other agents read their own
+The `claude-keep` CLI is auto-added to PATH while the plugin is enabled. Other agents read their own
 manifests (`.cursor-plugin/`, `.codex-plugin/`, `gemini-extension.json`, `.opencode/`).
 
 ## Use
 
 ```bash
 # once: turn on the self-heal timer (survives reboot via lingering)
-csk install-timer --interval 5
+claude-keep install-timer --interval 5
 
 # in each session you want to keep — the agent runs this in its own session:
-csk add
+claude-keep add
 
 # manage
-csk ls                 # registry + who's live
-csk rm trendwatcher    # stop tracking one (bare title or full cc— name)
-csk restore            # manually bring back everything that's down
+claude-keep ls                 # registry + who's live
+claude-keep rm trendwatcher    # stop tracking one (bare title or full cc— name)
+claude-keep restore            # manually bring back everything that's down
 ```
 
-`csk add` needs no arguments — it reads the calling session's own environment
+`claude-keep add` needs no arguments — it reads the calling session's own environment
 (`$CLAUDE_CODE_SESSION_ID`, the tmux session name, `$PWD`, `$CLAUDE_EFFORT`). Model isn't
 stored; `claude --resume` restores the session's own model.
 
@@ -65,9 +65,9 @@ network-mounted cwd, give that mount its **own** keeper. The two reconcile indep
 
 | Path | What |
 |---|---|
-| `bin/csk` | the CLI (self-contained bash) |
+| `bin/claude-keep` | the CLI (self-contained bash) |
 | `skills/claude-session-keeper/SKILL.md` | the skill (agent instructions) |
-| `~/.claude-session-keeper/sessions.tsv` | the registry (override with `$CSK_HOME`) |
+| `~/.claude-keep/sessions.tsv` | the registry (override with `$CLAUDE_KEEP_HOME`) |
 
 ## Versioning
 

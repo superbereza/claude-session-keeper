@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# csk — claude-session-keeper: persist long-running Claude Code (Remote Control)
+# claude-keep — claude-session-keeper: persist long-running Claude Code (Remote Control)
 # tmux sessions across reboots and crashes, and self-heal them on a timer.
 #
 # A session registers ITSELF (no args — reads its own env), the registry is a
-# plain TSV, and `csk restore` re-launches anything that died. A systemd --user
+# plain TSV, and `claude-keep restore` re-launches anything that died. A systemd --user
 # timer runs `restore` periodically so a session that dies (reboot, OOM, the Mac
 # sleeping and dropping a network-mounted cwd) comes back on its own.
 #
 # Subcommands:
-#   csk add [--no-rc] [--effort <e>]   Register THIS session (reads $CLAUDE_CODE_SESSION_ID,
+#   claude-keep add [--no-rc] [--effort <e>]   Register THIS session (reads $CLAUDE_CODE_SESSION_ID,
 #                                      the tmux session name, $PWD, $CLAUDE_EFFORT).
-#   csk rm [name]                      Remove THIS session (no arg) or a named one.
-#   csk ls                             List the registry + who is live right now.
-#   csk restore                        Re-launch every registered session that isn't live.
-#   csk install-timer [--interval M]   Install a systemd --user timer (default 5 min) → restore.
-#   csk uninstall-timer                Remove the timer.
+#   claude-keep rm [name]                      Remove THIS session (no arg) or a named one.
+#   claude-keep ls                             List the registry + who is live right now.
+#   claude-keep restore                        Re-launch every registered session that isn't live.
+#   claude-keep install-timer [--interval M]   Install a systemd --user timer (default 5 min) → restore.
+#   claude-keep uninstall-timer                Remove the timer.
 #
-# Registry: ${CSK_HOME:-~/.claude-session-keeper}/sessions.tsv
+# Registry: ${CLAUDE_KEEP_HOME:-~/.claude-keep}/sessions.tsv
 #   columns: tmux_name <TAB> uuid <TAB> cwd <TAB> effort <TAB> rc
 #   rc=1 → re-issue /remote-control after resume (these are Remote Control sessions);
 #   rc=0 → plain tmux session, no Remote Control.
@@ -26,13 +26,13 @@
 #   - restore answers the "Resume session?" dialog with option 2 (full) — never a
 #     lossy summary — matching the long-running-session convention.
 #   - a missing/unreachable cwd (e.g. a network mount not up yet) is SKIPPED, not
-#     failed — the next timer tick retries once the mount is back. csk knows nothing
+#     failed — the next timer tick retries once the mount is back. claude-keep knows nothing
 #     about mounts; keep mounts healthy with their own keeper.
 
 set -uo pipefail
 
-CSK_HOME="${CSK_HOME:-$HOME/.claude-session-keeper}"
-TSV="$CSK_HOME/sessions.tsv"
+CLAUDE_KEEP_HOME="${CLAUDE_KEEP_HOME:-$HOME/.claude-keep}"
+TSV="$CLAUDE_KEEP_HOME/sessions.tsv"
 CLAUDE="${CLAUDE:-$(command -v claude 2>/dev/null || echo "$HOME/.npm-global/bin/claude")}"
 EM=$'—'   # em-dash used in cc— session names
 
@@ -49,7 +49,7 @@ fi
 die() { _r "✗ $*" >&2; echo >&2; exit 1; }
 
 ensure_registry() {
-  mkdir -p "$CSK_HOME"
+  mkdir -p "$CLAUDE_KEEP_HOME"
   if [[ ! -f "$TSV" ]]; then
     {
       echo "# claude-session-keeper registry"
@@ -94,8 +94,8 @@ cmd_add() {
   effort="${effort_override:-$(self_effort)}"
   (( no_rc )) && rc=0
 
-  [[ -n "$uuid" ]] || die "no \$CLAUDE_CODE_SESSION_ID — run 'csk add' from inside a Claude Code session"
-  [[ -n "$name" ]] || die "not inside a tmux session (no \$TMUX) — csk tracks tmux sessions"
+  [[ -n "$uuid" ]] || die "no \$CLAUDE_CODE_SESSION_ID — run 'claude-keep add' from inside a Claude Code session"
+  [[ -n "$name" ]] || die "not inside a tmux session (no \$TMUX) — claude-keep tracks tmux sessions"
 
   ensure_registry
   _drop_row "$name"                                   # upsert by tmux_name
@@ -229,20 +229,20 @@ cmd_install_timer() {
     esac
     shift
   done
-  local self; self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/csk
+  local self; self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude-keep
   local ud="$HOME/.config/systemd/user"
   mkdir -p "$ud"
 
-  cat > "$ud/csk-restore.service" <<EOF
+  cat > "$ud/claude-keep-restore.service" <<EOF
 [Unit]
 Description=claude-session-keeper — restore missing sessions
 [Service]
 Type=oneshot
-Environment=CSK_HOME=$CSK_HOME
+Environment=CLAUDE_KEEP_HOME=$CLAUDE_KEEP_HOME
 ExecStart=$self restore
 EOF
 
-  cat > "$ud/csk-restore.timer" <<EOF
+  cat > "$ud/claude-keep-restore.timer" <<EOF
 [Unit]
 Description=claude-session-keeper — periodic self-heal
 [Timer]
@@ -254,20 +254,20 @@ WantedBy=timers.target
 EOF
 
   systemctl --user daemon-reload
-  systemctl --user enable --now csk-restore.timer >/dev/null 2>&1
+  systemctl --user enable --now claude-keep-restore.timer >/dev/null 2>&1
   # survive logout / run after reboot without an active login session
   loginctl enable-linger "$USER" >/dev/null 2>&1 || \
     _y "⚠ could not enable-linger; timer may not run before you log in after a reboot"
 
   _g "✓ timer installed: every ${interval} min (+2 min after boot)"; echo
-  echo "    check:  systemctl --user list-timers csk-restore.timer"
-  echo "    logs:   journalctl --user -u csk-restore.service"
+  echo "    check:  systemctl --user list-timers claude-keep-restore.timer"
+  echo "    logs:   journalctl --user -u claude-keep-restore.service"
 }
 
 cmd_uninstall_timer() {
   local ud="$HOME/.config/systemd/user"
-  systemctl --user disable --now csk-restore.timer >/dev/null 2>&1
-  rm -f "$ud/csk-restore.timer" "$ud/csk-restore.service"
+  systemctl --user disable --now claude-keep-restore.timer >/dev/null 2>&1
+  rm -f "$ud/claude-keep-restore.timer" "$ud/claude-keep-restore.service"
   systemctl --user daemon-reload
   _g "✓ timer removed"; echo
 }
@@ -287,7 +287,7 @@ main() {
     install-timer)    cmd_install_timer "$@" ;;
     uninstall-timer)  cmd_uninstall_timer "$@" ;;
     ""|help|-h|--help) usage ;;
-    *) die "unknown command '$cmd' (try: csk help)" ;;
+    *) die "unknown command '$cmd' (try: claude-keep help)" ;;
   esac
 }
 main "$@"
