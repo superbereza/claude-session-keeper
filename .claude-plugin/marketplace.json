@@ -1,0 +1,15 @@
+{
+  "name": "claude-session-keeper",
+  "description": "Self-marketplace for the claude-session-keeper plugin (persist & self-heal Claude Code sessions)",
+  "owner": {
+    "name": "superbereza"
+  },
+  "plugins": [
+    {
+      "name": "claude-session-keeper",
+      "description": "Persist long-running Claude Code Remote Control / tmux sessions across reboots and crashes — CLI + skill",
+      "version": "0.1.0",
+      "source": "./"
+    }
+  ]
+}

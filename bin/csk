@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# csk — claude-session-keeper: persist long-running Claude Code (Remote Control)
+# tmux sessions across reboots and crashes, and self-heal them on a timer.
+#
+# A session registers ITSELF (no args — reads its own env), the registry is a
+# plain TSV, and `csk restore` re-launches anything that died. A systemd --user
+# timer runs `restore` periodically so a session that dies (reboot, OOM, the Mac
+# sleeping and dropping a network-mounted cwd) comes back on its own.
+#
+# Subcommands:
+#   csk add [--no-rc] [--effort <e>]   Register THIS session (reads $CLAUDE_CODE_SESSION_ID,
+#                                      the tmux session name, $PWD, $CLAUDE_EFFORT).
+#   csk rm [name]                      Remove THIS session (no arg) or a named one.
+#   csk ls                             List the registry + who is live right now.
+#   csk restore                        Re-launch every registered session that isn't live.
+#   csk install-timer [--interval M]   Install a systemd --user timer (default 5 min) → restore.
+#   csk uninstall-timer                Remove the timer.
+#
+# Registry: ${CSK_HOME:-~/.claude-session-keeper}/sessions.tsv
+#   columns: tmux_name <TAB> uuid <TAB> cwd <TAB> effort <TAB> rc
+#   rc=1 → re-issue /remote-control after resume (these are Remote Control sessions);
+#   rc=0 → plain tmux session, no Remote Control.
+#
+# Notes:
+#   - model is NOT stored: `claude --resume <uuid>` restores the session's own model.
+#   - restore answers the "Resume session?" dialog with option 2 (full) — never a
+#     lossy summary — matching the long-running-session convention.
+#   - a missing/unreachable cwd (e.g. a network mount not up yet) is SKIPPED, not
+#     failed — the next timer tick retries once the mount is back. csk knows nothing
+#     about mounts; keep mounts healthy with their own keeper.
+
+set -uo pipefail
+
+CSK_HOME="${CSK_HOME:-$HOME/.claude-session-keeper}"
+TSV="$CSK_HOME/sessions.tsv"
+CLAUDE="${CLAUDE:-$(command -v claude 2>/dev/null || echo "$HOME/.npm-global/bin/claude")}"
+EM=$'—'   # em-dash used in cc— session names
+
+# ── styled output ─────────────────────────────────────────
+if [[ -t 1 ]]; then
+  _g() { printf '\033[32m%s\033[0m' "$*"; }
+  _y() { printf '\033[33m%s\033[0m' "$*"; }
+  _r() { printf '\033[31m%s\033[0m' "$*"; }
+  _b() { printf '\033[1m%s\033[0m' "$*"; }
+else
+  _g() { printf '%s' "$*"; }; _y() { printf '%s' "$*"; }
+  _r() { printf '%s' "$*"; }; _b() { printf '%s' "$*"; }
+fi
+die() { _r "✗ $*" >&2; echo >&2; exit 1; }
+
+ensure_registry() {
+  mkdir -p "$CSK_HOME"
+  if [[ ! -f "$TSV" ]]; then
+    {
+      echo "# claude-session-keeper registry"
+      echo "# tmux_name<TAB>uuid<TAB>cwd<TAB>effort<TAB>rc   (rc=1 → re-enable Remote Control)"
+    } > "$TSV"
+  fi
+}
+
+# ── identify the calling session from its own environment ──
+self_tmux_name() { tmux display-message -p '#{session_name}' 2>/dev/null; }
+self_uuid()      { printf '%s' "${CLAUDE_CODE_SESSION_ID:-}"; }
+self_effort()    { printf '%s' "${CLAUDE_EFFORT:-}"; }
+
+# exact field-1 (tmux_name) match — NOT a substring grep, which would let
+# "neighbor/x" match inside "cc—neighbor/x".
+_has_row() {
+  awk -F'\t' -v n="$1" '$1==n {found=1} END{exit found?0:1}' "$TSV" 2>/dev/null
+}
+# remove any registry row whose tmux_name (field 1) equals $1; returns 0 iff it removed one
+_drop_row() {
+  _has_row "$1" || return 1
+  local tmp; tmp=$(mktemp)
+  awk -F'\t' -v n="$1" 'NF==0 || $1 ~ /^#/ || $1 != n' "$TSV" > "$tmp" && mv "$tmp" "$TSV"
+}
+
+# ──────────────────────────────────────────────────────────────────
+cmd_add() {
+  local no_rc=0 effort_override="" rc=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-rc) no_rc=1 ;;
+      --effort) effort_override="${2:-}"; shift ;;
+      *) die "add: unknown arg '$1'" ;;
+    esac
+    shift
+  done
+
+  local uuid name cwd effort
+  uuid=$(self_uuid)
+  name=$(self_tmux_name)
+  cwd="$PWD"
+  effort="${effort_override:-$(self_effort)}"
+  (( no_rc )) && rc=0
+
+  [[ -n "$uuid" ]] || die "no \$CLAUDE_CODE_SESSION_ID — run 'csk add' from inside a Claude Code session"
+  [[ -n "$name" ]] || die "not inside a tmux session (no \$TMUX) — csk tracks tmux sessions"
+
+  ensure_registry
+  _drop_row "$name"                                   # upsert by tmux_name
+  printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$uuid" "$cwd" "$effort" "$rc" >> "$TSV"
+  _g "✓ registered: $name"; echo
+  echo "    uuid:   $uuid"
+  echo "    cwd:    $cwd"
+  echo "    effort: ${effort:-<default>}    remote-control: $([[ $rc == 1 ]] && echo yes || echo no)"
+}
+
+# ──────────────────────────────────────────────────────────────────
+cmd_rm() {
+  ensure_registry
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    name=$(self_tmux_name)
+    [[ -n "$name" ]] || die "rm: no session name given and not inside a tmux session"
+  elif ! _has_row "$name" && _has_row "cc${EM}${name}"; then
+    name="cc${EM}${name}"          # accept the bare title (without the cc— prefix)
+  fi
+  if _drop_row "$name"; then
+    _g "✓ removed: $name"; echo
+  else
+    _y "not in registry: $name"; echo
+  fi
+}
+
+# ──────────────────────────────────────────────────────────────────
+cmd_ls() {
+  ensure_registry
+  printf "  %-46s  %-5s  %-8s  %-7s  %s\n" "tmux session" "live" "effort" "rc" "cwd"
+  printf "  %-46s  %-5s  %-8s  %-7s  %s\n" "$(printf '%.0s-' {1..46})" "-----" "--------" "-------" "----"
+  local n_total=0 n_live=0
+  while IFS=$'\t' read -r name uuid cwd effort rc; do
+    [[ -z "${name:-}" || "${name:0:1}" == "#" ]] && continue
+    n_total=$((n_total+1))
+    local live="✗"
+    if tmux has-session -t "=$name" 2>/dev/null; then live="✓"; n_live=$((n_live+1)); fi
+    local cwd_mark="$cwd"
+    [[ -d "$cwd" ]] || cwd_mark="$cwd  (missing)"
+    printf "  %-46s  %-5s  %-8s  %-7s  %s\n" "$name" "$live" "${effort:-—}" "$([[ "${rc:-1}" == 1 ]] && echo yes || echo no)" "$cwd_mark"
+  done < "$TSV"
+  echo
+  echo "  $n_live/$n_total live   (registry: $TSV)"
+}
+
+# ── drive a freshly-resumed pane: answer the resume dialog, re-enable RC ──
+_drive_restore() {
+  local name="$1" rc="$2" title="${name#cc${EM}}"
+  local deadline=$((SECONDS + 45)) pane handled_resume=0 did_rc=0 confirmed_rc=0
+  while (( SECONDS < deadline )); do
+    pane=$(tmux capture-pane -p -J -t "=$name" -S -200 2>/dev/null || true)
+    # 1) "Resume session?" dialog → pick option 2 (full), never a summary
+    if (( !handled_resume )) && grep -q 'Resume full session as-is' <<<"$pane"; then
+      tmux send-keys -t "=$name" Down; sleep 0.6
+      tmux send-keys -t "=$name" Enter; sleep 1.5
+      handled_resume=1
+      continue
+    fi
+    # 2) once the TUI is ready, re-issue /remote-control if this was an RC session
+    if [[ "$rc" == "1" ]] && (( !did_rc )) && grep -q 'bypass permissions on' <<<"$pane"; then
+      tmux send-keys -t "=$name" "/remote-control ${title}"; sleep 0.4
+      tmux send-keys -t "=$name" Enter; sleep 1
+      did_rc=1
+      continue
+    fi
+    # 3) auto-confirm the one-time "Enable Remote Control" prompt
+    if (( !confirmed_rc )) && grep -q 'Enable Remote Control' <<<"$pane"; then
+      tmux send-keys -t "=$name" Enter; sleep 0.5
+      confirmed_rc=1
+      continue
+    fi
+    # done: RC active, or non-RC session that's ready
+    if [[ "$rc" == "1" ]]; then
+      grep -qE 'rc active|Remote Control active' <<<"$pane" && return 0
+    else
+      (( handled_resume )) && return 0
+      grep -q 'bypass permissions on' <<<"$pane" && return 0
+    fi
+    sleep 1
+  done
+  return 0   # best-effort; never block the restore loop
+}
+
+# ──────────────────────────────────────────────────────────────────
+cmd_restore() {
+  ensure_registry
+  [[ -x "$CLAUDE" ]] || die "claude not executable at $CLAUDE (set \$CLAUDE)"
+  command -v tmux >/dev/null || die "tmux not installed"
+
+  if ! "$CLAUDE" auth status 2>/dev/null | grep -q '"loggedIn": true'; then
+    _y "⚠ claude not logged in — sessions will start but API calls 401 until: $CLAUDE auth login"; echo
+  fi
+
+  local launched=0 skipped=0 waiting=0
+  while IFS=$'\t' read -r name uuid cwd effort rc; do
+    [[ -z "${name:-}" || "${name:0:1}" == "#" ]] && continue
+    rc="${rc:-1}"
+
+    if tmux has-session -t "=$name" 2>/dev/null; then
+      skipped=$((skipped+1)); continue
+    fi
+    # cwd not ready (e.g. a network mount still down) → leave for the next tick
+    if [[ ! -d "$cwd" ]] || ! timeout 8 ls "$cwd" >/dev/null 2>&1; then
+      _y "  … waiting on cwd: $name ($cwd)"; echo
+      waiting=$((waiting+1)); continue
+    fi
+
+    local launch="$CLAUDE --dangerously-skip-permissions --resume $uuid"
+    [[ -n "${effort:-}" ]] && launch+=" --effort $effort"
+    if tmux new-session -d -s "$name" -c "$cwd" "$launch" 2>/dev/null; then
+      _drive_restore "$name" "$rc"
+      _g "  ✨ restored: $name"; echo
+      launched=$((launched+1))
+    else
+      _r "  ✗ tmux launch failed: $name"; echo
+    fi
+  done < "$TSV"
+
+  echo
+  echo "restore: launched=$launched, already-live=$skipped, waiting-on-cwd=$waiting"
+}
+
+# ──────────────────────────────────────────────────────────────────
+cmd_install_timer() {
+  local interval=5
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --interval) interval="${2:-5}"; shift ;;
+      *) die "install-timer: unknown arg '$1'" ;;
+    esac
+    shift
+  done
+  local self; self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/csk
+  local ud="$HOME/.config/systemd/user"
+  mkdir -p "$ud"
+
+  cat > "$ud/csk-restore.service" <<EOF
+[Unit]
+Description=claude-session-keeper — restore missing sessions
+[Service]
+Type=oneshot
+Environment=CSK_HOME=$CSK_HOME
+ExecStart=$self restore
+EOF
+
+  cat > "$ud/csk-restore.timer" <<EOF
+[Unit]
+Description=claude-session-keeper — periodic self-heal
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${interval}min
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now csk-restore.timer >/dev/null 2>&1
+  # survive logout / run after reboot without an active login session
+  loginctl enable-linger "$USER" >/dev/null 2>&1 || \
+    _y "⚠ could not enable-linger; timer may not run before you log in after a reboot"
+
+  _g "✓ timer installed: every ${interval} min (+2 min after boot)"; echo
+  echo "    check:  systemctl --user list-timers csk-restore.timer"
+  echo "    logs:   journalctl --user -u csk-restore.service"
+}
+
+cmd_uninstall_timer() {
+  local ud="$HOME/.config/systemd/user"
+  systemctl --user disable --now csk-restore.timer >/dev/null 2>&1
+  rm -f "$ud/csk-restore.timer" "$ud/csk-restore.service"
+  systemctl --user daemon-reload
+  _g "✓ timer removed"; echo
+}
+
+usage() {
+  sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# ──────────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    add)              cmd_add "$@" ;;
+    rm|remove)        cmd_rm "$@" ;;
+    ls|list|status)   cmd_ls "$@" ;;
+    restore)          cmd_restore "$@" ;;
+    install-timer)    cmd_install_timer "$@" ;;
+    uninstall-timer)  cmd_uninstall_timer "$@" ;;
+    ""|help|-h|--help) usage ;;
+    *) die "unknown command '$cmd' (try: csk help)" ;;
+  esac
+}
+main "$@"
