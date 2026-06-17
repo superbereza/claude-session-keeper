@@ -8,7 +8,7 @@
     {
       "name": "claude-session-keeper",
       "description": "Persist long-running Claude Code Remote Control / tmux sessions across reboots and crashes — CLI + skill",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": "./"
     }
   ]

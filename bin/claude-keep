@@ -123,14 +123,28 @@ cmd_rm() {
   fi
 }
 
+# Split a TSV registry line into ROW_NAME/UUID/CWD/EFFORT/RC, PRESERVING empty
+# fields. `IFS=$'\t' read` collapses consecutive tabs (tab is a whitespace IFS),
+# which drops an empty effort field and shifts rc into it — so don't use it.
+_split_row() {
+  local rest="$1"
+  ROW_NAME="${rest%%$'\t'*}";   rest="${rest#*$'\t'}"
+  ROW_UUID="${rest%%$'\t'*}";   rest="${rest#*$'\t'}"
+  ROW_CWD="${rest%%$'\t'*}";    rest="${rest#*$'\t'}"
+  ROW_EFFORT="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  ROW_RC="$rest"
+}
+
 # ──────────────────────────────────────────────────────────────────
 cmd_ls() {
   ensure_registry
   printf "  %-46s  %-5s  %-8s  %-7s  %s\n" "tmux session" "live" "effort" "rc" "cwd"
   printf "  %-46s  %-5s  %-8s  %-7s  %s\n" "$(printf '%.0s-' {1..46})" "-----" "--------" "-------" "----"
   local n_total=0 n_live=0
-  while IFS=$'\t' read -r name uuid cwd effort rc; do
-    [[ -z "${name:-}" || "${name:0:1}" == "#" ]] && continue
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    [[ -z "$_line" || "${_line:0:1}" == "#" ]] && continue
+    _split_row "$_line"
+    local name="$ROW_NAME" uuid="$ROW_UUID" cwd="$ROW_CWD" effort="$ROW_EFFORT" rc="$ROW_RC"
     n_total=$((n_total+1))
     local live="✗"
     if tmux has-session -t "=$name" 2>/dev/null; then live="✓"; n_live=$((n_live+1)); fi
@@ -191,8 +205,10 @@ cmd_restore() {
   fi
 
   local launched=0 skipped=0 waiting=0
-  while IFS=$'\t' read -r name uuid cwd effort rc; do
-    [[ -z "${name:-}" || "${name:0:1}" == "#" ]] && continue
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    [[ -z "$_line" || "${_line:0:1}" == "#" ]] && continue
+    _split_row "$_line"
+    local name="$ROW_NAME" uuid="$ROW_UUID" cwd="$ROW_CWD" effort="$ROW_EFFORT" rc="$ROW_RC"
     rc="${rc:-1}"
 
     if tmux has-session -t "=$name" 2>/dev/null; then
