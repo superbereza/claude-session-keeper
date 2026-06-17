@@ -159,14 +159,20 @@ cmd_ls() {
 # ── drive a freshly-resumed pane: answer the resume dialog, re-enable RC ──
 _drive_restore() {
   local name="$1" rc="$2" title="${name#cc${EM}}"
-  local deadline=$((SECONDS + 45)) pane handled_resume=0 did_rc=0 confirmed_rc=0
+  local deadline=$((SECONDS + 60)) pane did_rc=0 confirmed_rc=0
   while (( SECONDS < deadline )); do
     pane=$(tmux capture-pane -p -J -t "=$name" -S -200 2>/dev/null || true)
-    # 1) "Resume session?" dialog → pick option 2 (full), never a summary
-    if (( !handled_resume )) && grep -q 'Resume full session as-is' <<<"$pane"; then
-      tmux send-keys -t "=$name" Down; sleep 0.6
-      tmux send-keys -t "=$name" Enter; sleep 1.5
-      handled_resume=1
+    # 1) "Resume session?" dialog → land on option 2 (full), never a summary.
+    #    Drive by the cursor's ACTUAL position (the ❯ marker) each pass: press Down
+    #    only while the cursor isn't yet on "full" (so it never overshoots to
+    #    "Don't ask"), and re-send Enter while it is — a dropped Down or dropped
+    #    Enter just retries on the next pass instead of leaving the dialog stuck.
+    if grep -q 'Resume full session as-is' <<<"$pane"; then
+      if grep -qE '❯.*Resume full session as-is' <<<"$pane"; then
+        tmux send-keys -t "=$name" Enter; sleep 1.2
+      else
+        tmux send-keys -t "=$name" Down; sleep 0.5
+      fi
       continue
     fi
     # 2) once the TUI is ready, re-issue /remote-control if this was an RC session
@@ -186,7 +192,6 @@ _drive_restore() {
     if [[ "$rc" == "1" ]]; then
       grep -qE 'rc active|Remote Control active' <<<"$pane" && return 0
     else
-      (( handled_resume )) && return 0
       grep -q 'bypass permissions on' <<<"$pane" && return 0
     fi
     sleep 1
