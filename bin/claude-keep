@@ -33,7 +33,20 @@ set -uo pipefail
 
 CLAUDE_KEEP_HOME="${CLAUDE_KEEP_HOME:-$HOME/.claude-keep}"
 TSV="$CLAUDE_KEEP_HOME/sessions.tsv"
-CLAUDE="${CLAUDE:-$(command -v claude 2>/dev/null || echo "$HOME/.npm-global/bin/claude")}"
+# Resolve the claude binary to an absolute path: prefer PATH, then known install
+# locations. The systemd --user timer runs with a minimal PATH that usually lacks
+# ~/.npm-global/bin, so a bare `command -v claude` is not enough. Honour an explicit
+# $CLAUDE override. (Mirrors resolve_claude() in claude-remote-launcher.)
+_resolve_claude() {
+  local c
+  c=$(command -v claude 2>/dev/null) && { printf '%s\n' "$c"; return 0; }
+  for c in "$HOME/.npm-global/bin/claude" "$HOME/.local/bin/claude" \
+           "$HOME/.claude/local/claude" /usr/local/bin/claude; do
+    [[ -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  printf '%s\n' "$HOME/.npm-global/bin/claude"   # last-resort guess; -x is checked at use
+}
+CLAUDE="${CLAUDE:-$(_resolve_claude)}"
 EM=$'—'   # em-dash used in cc— session names
 
 # ── styled output ─────────────────────────────────────────
