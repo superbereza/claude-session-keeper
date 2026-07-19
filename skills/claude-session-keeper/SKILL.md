@@ -49,6 +49,33 @@ For each registered session that isn't currently live:
   - answers the **"Resume session?"** dialog with **option 2 (full)** — never a lossy summary;
   - re-issues **`/remote-control <title>`** (unless `--no-rc`) and auto-confirms the prompt.
 
+## Notifications (optional)
+
+The keeper never sends over the network itself and **bundles no notifier**. To get alerts
+(e.g. a session that stays down and can't be relaunched), point **`$KEEP_NOTIFY_CMD`** at a
+**single command** that takes the message as its **first argument** — the keeper runs exactly
+`"$KEEP_NOTIFY_CMD" "the message"` (the value is one command, not a shell line):
+
+```bash
+export KEEP_NOTIFY_CMD='my-notify'          # your own wrapper: `my-notify "text"` → sends it
+```
+
+Need a pipeline or curl? Put it in a tiny wrapper script and point at that:
+
+```bash
+cat > ~/bin/keep-notify <<'EOF'
+#!/usr/bin/env bash
+curl -s -d "$1" ntfy.sh/my-topic >/dev/null    # $1 is the message
+EOF
+chmod +x ~/bin/keep-notify
+export KEEP_NOTIFY_CMD=keep-notify
+```
+
+Unset → the keeper runs silently (logs to stderr). Set it in the environment the timer runs
+under — e.g. a systemd drop-in `~/.config/systemd/user/claude-keep-restore.service.d/notify.conf`
+with `[Service]\nEnvironment=KEEP_NOTIFY_CMD=…` — so alerts fire unattended. This keeps the repo
+notifier-agnostic: wire your own channel in without patching the code.
+
 ## Typical setup
 
 ```bash

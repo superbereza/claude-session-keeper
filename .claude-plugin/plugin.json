@@ -1,7 +1,7 @@
 {
   "name": "claude-session-keeper",
   "description": "Persist long-running Claude Code Remote Control / tmux sessions across reboots and crashes — sessions self-register, and a systemd timer self-heals anything that died. Skill + CLI (claude-keep).",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "author": {
     "name": "superbereza"
   },

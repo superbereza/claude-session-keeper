@@ -61,6 +61,21 @@ else
 fi
 die() { _r "✗ $*" >&2; echo >&2; exit 1; }
 
+# ── notifications (optional, pluggable) ───────────────────────────────────────
+# The keeper never sends over the network itself and bundles no notifier. Point
+# $KEEP_NOTIFY_CMD at ANY command that takes the message as its first argument — a
+# Telegram bot wrapper, an ntfy one-liner (`curl -d "$1" ntfy.sh/your-topic`), your
+# own script — to receive alerts. Unset → the keeper stays silent (logs to stderr).
+# This keeps the repo notifier-agnostic; wire your channel in via the env var.
+notify() {
+  local cmd="${KEEP_NOTIFY_CMD:-}"
+  if [[ -n "$cmd" ]]; then
+    "$cmd" "$*" >/dev/null 2>&1 || printf 'claude-keep: notify failed: %s\n' "$*" >&2
+  else
+    printf 'claude-keep: [no notifier] %s\n' "$*" >&2
+  fi
+}
+
 ensure_registry() {
   mkdir -p "$CLAUDE_KEEP_HOME"
   if [[ ! -f "$TSV" ]]; then
@@ -246,6 +261,7 @@ cmd_restore() {
       launched=$((launched+1))
     else
       _r "  ✗ tmux launch failed: $name"; echo
+      notify "⚠ claude-keep: session '$name' is down and tmux relaunch failed — needs a human"
     fi
   done < "$TSV"
 

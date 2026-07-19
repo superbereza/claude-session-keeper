@@ -45,6 +45,10 @@ Two concerns, deliberately decoupled — this repo owns only the first:
 tick; it never blocks or fails on it. If your sessions live on a network mount, give that
 mount its own keeper — the two reconcile independently on their own timers.
 
+**Notifications are a pluggable seam, not a dependency:** the keeper calls `$KEEP_NOTIFY_CMD`
+"message" if set, else stays silent. Bring your own notifier (Telegram, ntfy, anything) — the
+repo bundles none. See the SKILL's "Notifications (optional)" section.
+
 ## Maintainer note
 
 Changing a skill or its payload reaches installed plugins **only after a release** —
