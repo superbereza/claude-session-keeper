@@ -36,8 +36,11 @@ Model is **not** stored — `claude --resume` restores the session's own model.
 | `claude-keep rm [name]` | Remove THIS session (no arg) or a named one. Accepts the bare title (`yango`) or full tmux name (`cc—dev-serv-in/yango`). |
 | `claude-keep ls` | List the registry + who is live right now. |
 | `claude-keep restore` | Re-launch every registered session that isn't live. Idempotent. |
+| `claude-keep rc-restore [--now]` | Re-establish **Remote Control** on LIVE sessions whose RC channel dropped (it just re-issues `/remote-control` into the existing pane — no relaunch). Alerts via `$KEEP_NOTIFY_CMD` if a manual re-login is what's blocking it. `--now` skips the hysteresis. |
 | `claude-keep install-timer [--interval M]` | Install a systemd --user timer (default 5 min) that runs `restore`. |
-| `claude-keep uninstall-timer` | Remove the timer. |
+| `claude-keep uninstall-timer` | Remove the restore timer. |
+| `claude-keep install-rc-timer [--interval M]` | Install a systemd --user timer that runs `rc-restore` (background Remote Control monitor). |
+| `claude-keep uninstall-rc-timer` | Remove the RC monitor timer. |
 
 ## Restore behaviour (what the timer does)
 
@@ -48,6 +51,26 @@ For each registered session that isn't currently live:
 - otherwise → `tmux new-session … claude --resume <uuid> [--effort <e>]`, then it:
   - answers the **"Resume session?"** dialog with **option 2 (full)** — never a lossy summary;
   - re-issues **`/remote-control <title>`** (unless `--no-rc`) and auto-confirms the prompt.
+
+## Remote Control monitor (`rc-restore`)
+
+Distinct from `restore`: `restore` relaunches **dead** sessions (a new process); `rc-restore`
+touches only **live** sessions whose Remote Control *channel* dropped (e.g. after the shared
+OAuth token's periodic refresh) and re-issues `/remote-control` into the existing pane — cheap,
+no relaunch. Guardrails, learned the hard way scraping a TUI:
+
+- **idle-gate** — a session mid-generation is never touched;
+- **hysteresis** — a session must read "RC dropped" `RC_FAIL_THRESHOLD` (default 2) checks in a
+  row before it's acted on (a transient mis-read doesn't trigger a spurious re-issue); `--now`
+  sets the threshold to 1 for on-demand use;
+- **ordered + gated** — reconnects one at a time, a chosen session first (`RC_FIRST`, default
+  matches `dev-helper`), and **stops** if the box is loaded (`RC_GATE_MEM_MIN` MiB-available
+  floor; load ceiling), alerting via `$KEEP_NOTIFY_CMD` that some sessions are still without RC;
+- **login-aware** — if the shared credential has no refresh token (genuinely logged out), it
+  alerts "run /login" and does **not** thrash RC (a login is the real blocker). Note an expired
+  *access* token is normal — it refreshes on use — so that alone is never treated as login-needed.
+
+Run it on a timer with `install-rc-timer` for unattended Remote Control monitoring.
 
 ## Notifications (optional)
 
