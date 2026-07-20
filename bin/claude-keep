@@ -348,9 +348,12 @@ RC_FAIL_THRESHOLD="${RC_FAIL_THRESHOLD:-2}"   # consecutive 'dropped' reads befo
 RC_FIRST="${RC_FIRST:-dev-helper}"            # reconnect a session matching this substring FIRST
 RC_GATE_MEM_MIN="${RC_GATE_MEM_MIN:-300}"     # MiB-available floor (stop if below)
 RC_PAUSE="${RC_PAUSE:-5}"                     # seconds between reconnects
-RC_MAX_PER_RUN="${RC_MAX_PER_RUN:-4}"         # reconnect at most N per run — poking a session
-                                              # wakes its npm auto-updater, so a batch of N per
-                                              # tick spreads that load instead of spiking it
+RC_MAX_PER_RUN="${RC_MAX_PER_RUN:-4}"         # reconnect at most N per run. Mass reconnect episodes
+                                              # correlated with a load spike (observed ~13 on 4 cores),
+                                              # so cap the batch and let the Persistent timer converge
+                                              # over ticks. NB: the spike's true cause is unverified
+                                              # (an earlier "npm auto-updater" guess was a bogus pgrep
+                                              # match on the .npm-global path — there was no npm storm).
 
 _nproc() { nproc 2>/dev/null || echo 4; }
 _avail_mib() { free -m 2>/dev/null | awk '/Mem:/{print $7}'; }
