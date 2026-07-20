@@ -348,6 +348,9 @@ RC_FAIL_THRESHOLD="${RC_FAIL_THRESHOLD:-2}"   # consecutive 'dropped' reads befo
 RC_FIRST="${RC_FIRST:-dev-helper}"            # reconnect a session matching this substring FIRST
 RC_GATE_MEM_MIN="${RC_GATE_MEM_MIN:-300}"     # MiB-available floor (stop if below)
 RC_PAUSE="${RC_PAUSE:-5}"                     # seconds between reconnects
+RC_MAX_PER_RUN="${RC_MAX_PER_RUN:-4}"         # reconnect at most N per run — poking a session
+                                              # wakes its npm auto-updater, so a batch of N per
+                                              # tick spreads that load instead of spiking it
 
 _nproc() { nproc 2>/dev/null || echo 4; }
 _avail_mib() { free -m 2>/dev/null | awk '/Mem:/{print $7}'; }
@@ -491,14 +494,22 @@ cmd_rc_restore() {
     if (( n < RC_FAIL_THRESHOLD )); then suspect=$((suspect+1)); _y "  suspect ($n/$RC_FAIL_THRESHOLD): ${name#cc${EM}}"; echo; continue; fi
     if ! _gate_ok; then
       gated=1
-      notify "⚠ claude-keep rc: machine loaded ($GATE_WHY) — stopped RC restore, some sessions still without RC"
+      # dedup: one alert per loaded episode, not one per tick (cleared on a clean run below)
+      if [[ ! -e "$RC_STATE_DIR/gate-alerted" ]]; then
+        notify "⚠ claude-keep rc: machine loaded ($GATE_WHY) — pausing RC restore; will resume when load drops. Some sessions still without RC."
+        : > "$RC_STATE_DIR/gate-alerted"
+      fi
       _r "  ✗ gate: $GATE_WHY — stopping"; echo; break
     fi
     _b "  → reconnecting: ${name#cc${EM}}"; echo
     if _reconnect_rc "$name"; then _rc_reset_fail "$name"; reconnected=$((reconnected+1)); _g "    ✓ RC active"; echo
     else failed=$((failed+1)); _r "    ✗ RC not confirmed"; echo; fi
+    # cap per run: leave the rest for the next tick so the npm-update load stays spread out
+    (( reconnected >= RC_MAX_PER_RUN )) && { _y "  reached max per run ($RC_MAX_PER_RUN) — rest next tick"; echo; break; }
     sleep "$RC_PAUSE"
   done
+  # a run that finished without tripping the gate clears the dedup flag (episode over)
+  (( gated == 0 )) && rm -f "$RC_STATE_DIR/gate-alerted" 2>/dev/null || true
 
   echo
   echo "rc-restore: reconnected=$reconnected already-active=$active busy=$busy suspect=$suspect failed=$failed$([[ $gated == 1 ]] && echo ' GATED')"
