@@ -192,7 +192,9 @@ cmd_ls() {
 # ── drive a freshly-resumed pane: answer the resume dialog, re-enable RC ──
 _drive_restore() {
   local name="$1" rc="$2" title="${name#cc${EM}}"
-  local deadline=$((SECONDS + 60)) pane did_rc=0 confirmed_rc=0
+  # Big/old sessions (100k+ tokens) can take >60s to load before the resume dialog
+  # even appears — keep the window wide so the dialog gets driven, not left stuck.
+  local deadline=$((SECONDS + ${KEEP_DRIVE_TIMEOUT:-180})) pane did_rc=0 confirmed_rc=0
   while (( SECONDS < deadline )); do
     pane=$(tmux capture-pane -p -J -t "=$name" -S -200 2>/dev/null || true)
     # 1) "Resume session?" dialog → land on option 2 (full), never a summary.
