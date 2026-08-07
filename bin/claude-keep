@@ -192,11 +192,17 @@ cmd_ls() {
 # ── drive a freshly-resumed pane: answer the resume dialog, re-enable RC ──
 _drive_restore() {
   local name="$1" rc="$2" title="${name#cc${EM}}"
-  # Big/old sessions (100k+ tokens) can take >60s to load before the resume dialog
+  # Address the pane by its %ID, NOT by "=name": `capture-pane -t "=<em-dash name>"`
+  # silently returns EMPTY (a tmux quirk with the em-dash/slash in cc— names), which
+  # blinded this whole function — it never saw the resume dialog or the ready TUI, drove
+  # nothing, and burned the full window on EVERY session (~3 min each → 63 min/pass).
+  # Resolving once to a %pane-id fixes the sight; send-keys goes to the same id.
+  local pid; pid=$(_pane_of "$name"); [[ -z "$pid" ]] && return 0
+  # Big/old sessions (100k+ tokens) can take a while to load before the resume dialog
   # even appears — keep the window wide so the dialog gets driven, not left stuck.
   local deadline=$((SECONDS + ${KEEP_DRIVE_TIMEOUT:-180})) pane did_rc=0 confirmed_rc=0
   while (( SECONDS < deadline )); do
-    pane=$(tmux capture-pane -p -J -t "=$name" -S -200 2>/dev/null || true)
+    pane=$(tmux capture-pane -p -J -t "$pid" -S -200 2>/dev/null || true)
     # 1) "Resume session?" dialog → land on option 2 (full), never a summary.
     #    Drive by the cursor's ACTUAL position (the ❯ marker) each pass: press Down
     #    only while the cursor isn't yet on "full" (so it never overshoots to
@@ -204,28 +210,31 @@ _drive_restore() {
     #    Enter just retries on the next pass instead of leaving the dialog stuck.
     if grep -q 'Resume full session as-is' <<<"$pane"; then
       if grep -qE '❯.*Resume full session as-is' <<<"$pane"; then
-        tmux send-keys -t "=$name" Enter; sleep 1.2
+        tmux send-keys -t "$pid" Enter; sleep 1.2
       else
-        tmux send-keys -t "=$name" Down; sleep 0.5
+        tmux send-keys -t "$pid" Down; sleep 0.5
       fi
       continue
     fi
     # 2) once the TUI is ready, re-issue /remote-control if this was an RC session
     if [[ "$rc" == "1" ]] && (( !did_rc )) && grep -q 'bypass permissions on' <<<"$pane"; then
-      tmux send-keys -t "=$name" "/remote-control ${title}"; sleep 0.4
-      tmux send-keys -t "=$name" Enter; sleep 1
+      tmux send-keys -t "$pid" "/remote-control ${title}"; sleep 0.4
+      tmux send-keys -t "$pid" Enter; sleep 1
       did_rc=1
       continue
     fi
     # 3) auto-confirm the one-time "Enable Remote Control" prompt
     if (( !confirmed_rc )) && grep -q 'Enable Remote Control' <<<"$pane"; then
-      tmux send-keys -t "=$name" Enter; sleep 0.5
+      tmux send-keys -t "$pid" Enter; sleep 0.5
       confirmed_rc=1
       continue
     fi
-    # done: RC active, or non-RC session that's ready
+    # done: RC active, or non-RC session that's ready. Match the line a FRESH resume
+    # actually prints ("/remote-control is active · Continue here…") plus the status-bar
+    # and mgmt-panel variants — the old 'rc active'-only check never matched that line, so
+    # _drive_restore waited the full window on EVERY session (~3 min each → 63 min/pass).
     if [[ "$rc" == "1" ]]; then
-      grep -qE 'rc active|Remote Control active' <<<"$pane" && return 0
+      grep -qiE 'remote-control is active|Remote Control active|/rc active|available in the Claude mobile app' <<<"$pane" && return 0
     else
       grep -q 'bypass permissions on' <<<"$pane" && return 0
     fi
