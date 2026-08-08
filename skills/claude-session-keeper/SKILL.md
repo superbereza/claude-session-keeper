@@ -37,12 +37,10 @@ Model is **not** stored — `claude --resume` restores the session's own model.
 | `claude-keep ls` | List the registry + who is live right now. |
 | `claude-keep doctor` | Audit the registry against the transcripts on disk. Flags **DRIFT** (the `<uuid>.jsonl` moved to another cwd's project dir — e.g. the session wandered into a git worktree), **DEAD-CWD** (cwd deleted), and **LOST** (no transcript anywhere). These are the entries that silently fail to resume. Read-only; suggests the fix per row. |
 | `claude-keep migrate <session> <new-cwd>` | Relocate a session's transcript to `<new-cwd>` (copy its `<uuid>.jsonl` into that cwd's project dir + repoint the registry) so it resumes there. Fixes a DRIFT/DEAD-CWD, or deliberately moves a session's working dir. **Copies** (original kept as backup). |
-| `claude-keep restore` | Re-launch every registered session that isn't live. Idempotent. **Auto-heals a drifted transcript** (copies it into the registered cwd's project dir) and **skips a lost one** instead of launching a doomed `--resume`. |
-| `claude-keep rc-restore [--now]` | Re-establish **Remote Control** on LIVE sessions whose RC channel dropped (it just re-issues `/remote-control` into the existing pane — no relaunch). Alerts via `$KEEP_NOTIFY_CMD` if a manual re-login is what's blocking it. `--now` skips the hysteresis. |
-| `claude-keep install-timer [--interval M]` | Install a systemd --user timer (default 5 min) that runs `restore`. |
+| `claude-keep restore` | Re-launch every registered session that isn't live, then **tidy** the live ones. Idempotent. **Auto-heals a drifted transcript** (copies it into the registered cwd's project dir) and **skips a lost one** instead of launching a doomed `--resume`. |
+| `claude-keep tidy` | Tidy **LIVE** sessions only (no relaunch): clear a stuck **"Resume session?"** dialog (option 2 = full) or a stuck **Remote Control** management panel left by a manual `/remote-control` re-issue, and alert via `$KEEP_NOTIFY_CMD` if the shared login is logged out. Folded into `restore`, so the one timer keeps sessions both **alive and usable**. |
+| `claude-keep install-timer [--interval M]` | Install a systemd --user timer (default 5 min) that runs `restore` (which now includes the tidy pass). |
 | `claude-keep uninstall-timer` | Remove the restore timer. |
-| `claude-keep install-rc-timer [--interval M]` | Install a systemd --user timer that runs `rc-restore` (background Remote Control monitor). |
-| `claude-keep uninstall-rc-timer` | Remove the RC monitor timer. |
 
 ## Restore behaviour (what the timer does)
 
@@ -54,25 +52,38 @@ For each registered session that isn't currently live:
   - answers the **"Resume session?"** dialog with **option 2 (full)** — never a lossy summary;
   - re-issues **`/remote-control <title>`** (unless `--no-rc`) and auto-confirms the prompt.
 
-## Remote Control monitor (`rc-restore`)
+**Memory gate.** Each `--resume` is a full process loading its whole transcript — a real memory
+spike. So restore **paces** its relaunches (it drives each session's resume dialog to completion
+before the next) and **stops** if free memory falls below a floor (`$KEEP_RESTORE_MEM_MIN` MiB,
+default 400), leaving the rest for the next tick and alerting via `$KEEP_NOTIFY_CMD`. This is what
+keeps an **OOM-driven mass restart** (the box ran out of RAM and killed a batch of sessions) from
+piling N heavy resumes back onto an already-tight box — it brings them back gradually as memory
+frees. A box without `free` is treated as "plenty" (the gate never blocks on a missing reading).
 
-Distinct from `restore`: `restore` relaunches **dead** sessions (a new process); `rc-restore`
-touches only **live** sessions whose Remote Control *channel* dropped (e.g. after the shared
-OAuth token's periodic refresh) and re-issues `/remote-control` into the existing pane — cheap,
-no relaunch. Guardrails, learned the hard way scraping a TUI:
+Then a second pass **tidies every live session** (`tidy`, below).
 
-- **idle-gate** — a session mid-generation is never touched;
-- **hysteresis** — a session must read "RC dropped" `RC_FAIL_THRESHOLD` (default 2) checks in a
-  row before it's acted on (a transient mis-read doesn't trigger a spurious re-issue); `--now`
-  sets the threshold to 1 for on-demand use;
-- **ordered + gated** — reconnects one at a time, a chosen session first (`RC_FIRST`, default
-  matches `dev-helper`), and **stops** if the box is loaded (`RC_GATE_MEM_MIN` MiB-available
-  floor; load ceiling), alerting via `$KEEP_NOTIFY_CMD` that some sessions are still without RC;
+## Tidying live sessions (`tidy`)
+
+`restore` relaunches **dead** sessions; `tidy` touches only **live** ones — it brings a
+session's TUI back to a clean prompt without relaunching. It's folded into `restore` (and its
+timer), and also runnable on its own. What it clears, all from a safe idle-gated pane scrape:
+
+- a stuck **"Resume session?"** dialog → answers **option 2 (full)**, never a lossy summary;
+- a stuck **Remote Control management panel** (Disconnect / QR / Continue) — the kind left
+  behind by re-issuing `/remote-control` on an already-live session → dismissed;
+- the one-time **"Enable Remote Control"** confirm → accepted.
+
+Guardrails, learned the hard way scraping a TUI:
+
+- **idle-gate** — a session mid-generation (`esc to interrupt`) is never touched;
+- **only answers/dismisses dialogs** — it **never re-issues `/remote-control`** itself (that
+  class of action is exactly what leaves panels stuck), so it can't make a mess it then has to
+  clean up. Dropped Remote Control on a *live* session is recovered by the operator reissuing
+  `/remote-control`, or simply by the session's next `restore` cycle — not by scraping RC state;
 - **login-aware** — if the shared credential has no refresh token (genuinely logged out), it
-  alerts "run /login" and does **not** thrash RC (a login is the real blocker). Note an expired
-  *access* token is normal — it refreshes on use — so that alone is never treated as login-needed.
-
-Run it on a timer with `install-rc-timer` for unattended Remote Control monitoring.
+  emits one deduped "run `claude auth login`" alert via `$KEEP_NOTIFY_CMD` and otherwise does
+  nothing (a login is the real blocker). An expired *access* token is normal — it refreshes on
+  use — so that alone is never treated as login-needed.
 
 ## Session migration — the transcript is portable (canonical)
 

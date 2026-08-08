@@ -18,15 +18,13 @@
 #   claude-keep migrate <session> <new-cwd>    Relocate a session's transcript to a new cwd (copy jsonl +
 #                                      repoint registry) so it resumes there — fixes a DRIFT/DEAD-CWD, or
 #                                      deliberately moves a session's working dir. Original kept as backup.
-#   claude-keep restore                        Re-launch every registered session that isn't live.
-#                                      (Auto-heals a drifted transcript; skips a lost one.)
-#   claude-keep rc-restore [--now]             Re-establish Remote Control on LIVE sessions whose RC
-#                                      dropped; alert (via $KEEP_NOTIFY_CMD) when a manual re-login is
-#                                      what's blocking it. --now skips the hysteresis (on-demand).
-#   claude-keep install-timer [--interval M]   Install a systemd --user timer (default 5 min) → restore.
+#   claude-keep restore                        Re-launch every registered session that isn't live, then
+#                                      tidy the live ones. (Auto-heals a drifted transcript; skips a lost one.)
+#   claude-keep tidy                           Tidy LIVE sessions only: clear a stuck "Resume session?"
+#                                      dialog (option 2 = full) or a stuck Remote Control panel, and alert
+#                                      (via $KEEP_NOTIFY_CMD) if the shared login is logged out. No relaunch.
+#   claude-keep install-timer [--interval M]   Install a systemd --user timer (default 5 min) → restore (+tidy).
 #   claude-keep uninstall-timer                Remove the restore timer.
-#   claude-keep install-rc-timer [--interval M]  Install a systemd --user timer → rc-restore (RC monitor).
-#   claude-keep uninstall-rc-timer             Remove the RC monitor timer.
 #
 # Registry: ${CLAUDE_KEEP_HOME:-~/.claude-keep}/sessions.tsv
 #   columns: tmux_name <TAB> uuid <TAB> cwd <TAB> effort <TAB> rc
@@ -40,6 +38,9 @@
 #   - a missing/unreachable cwd (e.g. a network mount not up yet) is SKIPPED, not
 #     failed — the next timer tick retries once the mount is back. claude-keep knows nothing
 #     about mounts; keep mounts healthy with their own keeper.
+#   - restore paces its relaunches and STOPS if free memory drops below a floor
+#     ($KEEP_RESTORE_MEM_MIN MiB, default 400), leaving the rest for the next tick — so an
+#     OOM-driven mass restart can't pile N heavy `--resume` processes onto an already-tight box.
 
 set -uo pipefail
 
@@ -60,6 +61,20 @@ _resolve_claude() {
 }
 CLAUDE="${CLAUDE:-$(_resolve_claude)}"
 EM=$'—'   # em-dash used in cc— session names
+
+# ── restore memory gate ───────────────────────────────────────────────────────
+# Under sustained memory pressure, relaunching dead sessions can DEEPEN the problem:
+# each `claude --resume` is a full process loading its whole transcript → a real memory
+# spike. restore already serialises launches (it blocks in _drive_restore driving each
+# session's resume dialog before moving on), so it never forks a whole batch at once —
+# but the cumulative footprint of N resumed processes can still exhaust a tight box. So
+# before EACH launch restore checks free memory and, if it's below the floor, STOPS and
+# leaves the rest for the next tick (best-effort — it converges as memory frees), alerting
+# that some sessions are still down. Both knobs overridable; a box with `free` missing is
+# treated as "plenty" (the gate never blocks on a missing reading).
+KEEP_RESTORE_MEM_MIN="${KEEP_RESTORE_MEM_MIN:-400}"   # MiB-available floor; stop launching below it
+KEEP_RESTORE_PAUSE="${KEEP_RESTORE_PAUSE:-2}"         # settle margin (s) after a launch before the next
+_avail_mib() { free -m 2>/dev/null | awk '/^Mem:/{print $7}'; }
 
 # ── styled output ─────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -197,51 +212,26 @@ cmd_ls() {
 }
 
 # ── drive a freshly-resumed pane: answer the resume dialog, re-enable RC ──
+# _drive_restore — after a fresh launch, bring the session to RC-active. Dialog
+# handling (resume prompt, RC panel, Enable-RC confirm) is delegated to the shared
+# _tidy_pane; the one thing only THIS needs is issuing /remote-control on a fresh
+# session. Addresses the pane by %id (capture-pane -t "=<em-dash name>" returns empty).
 _drive_restore() {
   local name="$1" rc="$2" title="${name#cc${EM}}"
-  # Address the pane by its %ID, NOT by "=name": `capture-pane -t "=<em-dash name>"`
-  # silently returns EMPTY (a tmux quirk with the em-dash/slash in cc— names), which
-  # blinded this whole function — it never saw the resume dialog or the ready TUI, drove
-  # nothing, and burned the full window on EVERY session (~3 min each → 63 min/pass).
-  # Resolving once to a %pane-id fixes the sight; send-keys goes to the same id.
   local pid; pid=$(_pane_of "$name"); [[ -z "$pid" ]] && return 0
-  # Big/old sessions (100k+ tokens) can take a while to load before the resume dialog
-  # even appears — keep the window wide so the dialog gets driven, not left stuck.
-  local deadline=$((SECONDS + ${KEEP_DRIVE_TIMEOUT:-180})) pane did_rc=0 confirmed_rc=0
+  # Big/old sessions take a while to load before the resume dialog appears — keep the
+  # window wide (KEEP_DRIVE_TIMEOUT, default 180s) so it gets driven, not left stuck.
+  local deadline=$((SECONDS + ${KEEP_DRIVE_TIMEOUT:-180})) pane did_rc=0
   while (( SECONDS < deadline )); do
+    _tidy_pane "$pid"                     # answer resume dialog (full), dismiss panels, confirm Enable-RC
     pane=$(tmux capture-pane -p -J -t "$pid" -S -200 2>/dev/null || true)
-    # 1) "Resume session?" dialog → land on option 2 (full), never a summary.
-    #    Drive by the cursor's ACTUAL position (the ❯ marker) each pass: press Down
-    #    only while the cursor isn't yet on "full" (so it never overshoots to
-    #    "Don't ask"), and re-send Enter while it is — a dropped Down or dropped
-    #    Enter just retries on the next pass instead of leaving the dialog stuck.
-    if grep -q 'Resume full session as-is' <<<"$pane"; then
-      if grep -qE '❯.*Resume full session as-is' <<<"$pane"; then
-        tmux send-keys -t "$pid" Enter; sleep 1.2
-      else
-        tmux send-keys -t "$pid" Down; sleep 0.5
-      fi
-      continue
-    fi
-    # 2) once the TUI is ready, re-issue /remote-control if this was an RC session
-    if [[ "$rc" == "1" ]] && (( !did_rc )) && grep -q 'bypass permissions on' <<<"$pane"; then
-      tmux send-keys -t "$pid" "/remote-control ${title}"; sleep 0.4
-      tmux send-keys -t "$pid" Enter; sleep 1
-      did_rc=1
-      continue
-    fi
-    # 3) auto-confirm the one-time "Enable Remote Control" prompt
-    if (( !confirmed_rc )) && grep -q 'Enable Remote Control' <<<"$pane"; then
-      tmux send-keys -t "$pid" Enter; sleep 0.5
-      confirmed_rc=1
-      continue
-    fi
-    # done: RC active, or non-RC session that's ready. Match the line a FRESH resume
-    # actually prints ("/remote-control is active · Continue here…") plus the status-bar
-    # and mgmt-panel variants — the old 'rc active'-only check never matched that line, so
-    # _drive_restore waited the full window on EVERY session (~3 min each → 63 min/pass).
+    grep -q 'esc to interrupt' <<<"$pane" && { sleep 1; continue; }   # still loading — wait
     if [[ "$rc" == "1" ]]; then
       grep -qiE 'remote-control is active|Remote Control active|/rc active|available in the Claude mobile app' <<<"$pane" && return 0
+      # TUI ready, RC not yet enabled → enable it (the one action tidy deliberately won't do)
+      if (( !did_rc )) && grep -q 'bypass permissions on' <<<"$pane"; then
+        tmux send-keys -t "$pid" "/remote-control ${title}"; sleep 0.4; tmux send-keys -t "$pid" Enter; did_rc=1
+      fi
     else
       grep -q 'bypass permissions on' <<<"$pane" && return 0
     fi
@@ -292,20 +282,35 @@ cmd_restore() {
       fi
     fi
 
+    # memory gate: don't pile new claude processes onto an already-tight box — relaunch
+    # what we can now, leave the rest for the next tick (converges as memory frees).
+    local _mib; _mib=$(_avail_mib)
+    if [[ -n "$_mib" ]] && (( _mib < KEEP_RESTORE_MEM_MIN )); then
+      _y "  ⏸ low memory (${_mib}MiB < ${KEEP_RESTORE_MEM_MIN}MiB) — deferring remaining relaunches to next tick"; echo
+      notify "⚠ claude-keep: relaunches paused — only ${_mib}MiB free (< ${KEEP_RESTORE_MEM_MIN}); some sessions still down, retrying next tick"
+      break
+    fi
+
     local launch="$CLAUDE --dangerously-skip-permissions --resume $uuid"
     [[ -n "${effort:-}" ]] && launch+=" --effort $effort"
     if tmux new-session -d -s "$name" -c "$cwd" "$launch" 2>/dev/null; then
       _drive_restore "$name" "$rc"
       _g "  ✨ restored: $name"; echo
       launched=$((launched+1))
+      sleep "$KEEP_RESTORE_PAUSE"   # let the resumed process's footprint register before the next gate check
     else
       _r "  ✗ tmux launch failed: $name"; echo
       notify "⚠ claude-keep: session '$name' is down and tmux relaunch failed — needs a human"
     fi
   done < "$TSV"
 
+  # Second pass: tidy every LIVE session (clear stuck resume dialogs / RC panels left
+  # by a launch whose drive window closed, and by manual /remote-control re-issues) and
+  # emit the /login alert. One timer thus keeps sessions both ALIVE and USABLE.
+  _do_tidy_sweep
+
   echo
-  echo "restore: launched=$launched, already-live=$skipped, waiting-on-cwd=$waiting"
+  echo "restore: launched=$launched, already-live=$skipped, waiting-on-cwd=$waiting (+ tidied live)"
 }
 
 # ──────────────────────────────────────────────────────────────────
@@ -361,57 +366,6 @@ cmd_uninstall_timer() {
   _g "✓ timer removed"; echo
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# rc-restore — re-establish Remote Control on LIVE sessions whose RC channel
-# dropped, and alert when a manual re-login is what's actually blocking it.
-#
-# Unlike `restore` (which relaunches DEAD sessions → a new claude process), this
-# touches only sessions whose process is still running: it just re-issues
-# /remote-control into the existing pane. That's cheap (a websocket, not a fork),
-# so the metric gate here is a light backstop, not the main brake.
-#
-# Detection is deliberately guarded (RC state scraped from a TUI is fuzzy):
-#   • BUSY sessions (mid-generation) are never touched;
-#   • a 'dropped' read must repeat RC_FAIL_THRESHOLD times before we act
-#     (hysteresis — a transient mis-read doesn't trigger a spurious re-issue);
-#   • re-issuing on an already-active session only opens a dialog we dismiss, so
-#     a false positive is harmless, not destructive.
-# ══════════════════════════════════════════════════════════════════════════════
-RC_STATE_DIR="${RC_STATE_DIR:-$HOME/.cache/claude-keep-rc}"
-RC_FAIL_THRESHOLD="${RC_FAIL_THRESHOLD:-2}"   # consecutive 'dropped' reads before acting
-RC_FIRST="${RC_FIRST:-dev-helper}"            # reconnect a session matching this substring FIRST
-RC_GATE_MEM_MIN="${RC_GATE_MEM_MIN:-300}"     # MiB-available floor (stop if below)
-RC_PAUSE="${RC_PAUSE:-5}"                     # seconds between reconnects
-RC_MAX_PER_RUN="${RC_MAX_PER_RUN:-4}"         # reconnect at most N per run. Mass reconnect episodes
-                                              # correlated with a load spike (observed ~13 on 4 cores),
-                                              # so cap the batch and let the Persistent timer converge
-                                              # over ticks. NB: the spike's true cause is unverified
-                                              # (an earlier "npm auto-updater" guess was a bogus pgrep
-                                              # match on the .npm-global path — there was no npm storm).
-
-_nproc() { nproc 2>/dev/null || echo 4; }
-_avail_mib() { free -m 2>/dev/null | awk '/Mem:/{print $7}'; }
-_load1() { cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0; }
-GATE_WHY=""
-_gate_ok() {
-  # avail-mem is the REAL constraint for RC reconnects (a websocket, not a fork);
-  # load spikes transiently from each session's npm auto-update, not from RC — so the
-  # load ceiling is generous (2.5× cores) and mem is the tight gate. Both overridable.
-  local mem load max
-  mem=$(_avail_mib); load=$(_load1)
-  max="${RC_GATE_LOAD_MAX:-$(awk -v c="$(_nproc)" 'BEGIN{print c*2.5}')}"
-  if ! awk -v m="${mem:-0}" -v min="$RC_GATE_MEM_MIN" 'BEGIN{exit (m>=min)?0:1}'; then
-    GATE_WHY="avail ${mem}MiB < ${RC_GATE_MEM_MIN}MiB"; return 1; fi
-  if ! awk -v l="${load:-0}" -v mx="$max" 'BEGIN{exit (l<=mx)?0:1}'; then
-    GATE_WHY="load ${load} > ${max}"; return 1; fi
-  return 0
-}
-
-# per-session hysteresis counter (session names carry '/', sanitise for a filename)
-_rc_failfile() { printf '%s/fail-%s' "$RC_STATE_DIR" "$(printf '%s' "$1" | tr '/ ' '__')"; }
-_rc_bump_fail() { local n; n=$(( $(cat "$(_rc_failfile "$1")" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$(_rc_failfile "$1")" 2>/dev/null || true; echo "$n"; }
-_rc_reset_fail() { rm -f "$(_rc_failfile "$1")" 2>/dev/null || true; }
-
 # Tier-1 machine-wide login state from the SHARED OAuth credential file.
 # All sessions share ~/.claude/.credentials.json, so this is read once, not per-session.
 # Returns: ok | login-needed
@@ -442,172 +396,61 @@ PY
 # the full name in awk and capturing by pane id (%N) is exact and collision-proof.
 _pane_of() { tmux list-panes -a -F $'#{session_name}\t#{pane_id}' 2>/dev/null | awk -F'\t' -v s="$1" '$1==s{print $2; exit}'; }
 
-# RC state of a LIVE session, from its pane. Returns: active | dropped | busy
-# Signals learned by hand: fresh activation prints "remote-control is active";
-# a re-issue on a connected session opens a mgmt panel ("available in the Claude
-# mobile app" / "Disconnect this session"); the status bar shows "/rc active".
-_rc_state() {
-  local pid; pid=$(_pane_of "$1")
-  [[ -z "$pid" ]] && { echo dropped; return; }
-  local cap; cap=$(tmux capture-pane -p -J -t "$pid" -S -60 2>/dev/null || true)
-  [[ -z "$cap" ]] && { echo dropped; return; }
-  grep -q 'esc to interrupt' <<<"$cap" && { echo busy; return; }
-  grep -qiE 'remote-control is active|Remote Control active|available in the Claude mobile app|/rc active' \
-    <<<"$cap" && { echo active; return; }
-  echo dropped
-}
-
-# Re-issue /remote-control into a live pane and drive it to active. Handles the
-# transient that ate the command (re-issues every ~8s), the mgmt dialog (dismiss
-# with Enter), and the one-time "Enable Remote Control" confirm. 30s budget.
-_reconnect_rc() {
-  local name="$1" title="${name#cc${EM}}" pid pane end=$((SECONDS+30)) last=0
-  pid=$(_pane_of "$name"); [[ -z "$pid" ]] && return 1
-  while (( SECONDS < end )); do
-    pane=$(tmux capture-pane -p -J -t "$pid" -S -60 2>/dev/null || true)
-    if grep -qiE 'remote-control is active|Remote Control active|available in the Claude mobile app|/rc active' <<<"$pane"; then
-      # a mgmt dialog may be sitting open on top of the active state — dismiss it
-      grep -qiE 'Disconnect this session|Enter to select|Esc to continue' <<<"$pane" && { tmux send-keys -t "$pid" Enter; sleep 1; }
-      return 0
-    fi
-    # "connecting…" means the command took and RC is establishing — it settles to
-    # active on its own. Treat as success (don't wait for active, and crucially don't
-    # re-issue, which would interrupt the in-flight connect).
-    grep -qiE '/rc connecting|remote.control.*connecting' <<<"$pane" && return 0
-    if grep -q 'Enable Remote Control' <<<"$pane"; then tmux send-keys -t "$pid" Enter; sleep 1; continue; fi
-    if (( SECONDS - last >= 8 )); then
-      tmux send-keys -t "$pid" -l "/remote-control ${title}"; sleep 0.4; tmux send-keys -t "$pid" Enter
-      last=$SECONDS
-    fi
-    sleep 2
-  done
-  return 1
-}
-
-cmd_rc_restore() {
-  ensure_registry
-  command -v tmux >/dev/null || die "tmux not installed"
-  mkdir -p "$RC_STATE_DIR" 2>/dev/null || true
-  local now_mode=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --now) now_mode=1 ;;                         # act immediately (skip hysteresis) — for on-demand
-      *) die "rc-restore: unknown arg '$1'" ;;
-    esac; shift
-  done
-  (( now_mode )) && RC_FAIL_THRESHOLD=1
-
-  # ── Tier-1: login (machine-wide) ──
-  local st; st=$(_login_state)
-  if [[ "$st" == login-needed ]]; then
-    if [[ ! -e "$RC_STATE_DIR/login-alerted" ]]; then
-      notify "⚠ claude-keep: Claude OAuth token expired and refresh isn't happening — log in on the server ('claude auth login' / /login). Remote Control stays down until then."
-      : > "$RC_STATE_DIR/login-alerted"
-    fi
-    _y "⚠ login needed (token expired, refresh not happening) — alerted; skipping RC work"; echo
-    return 0
-  fi
-  rm -f "$RC_STATE_DIR/login-alerted" 2>/dev/null || true
-
-  # ── collect LIVE rc=1 sessions, RC_FIRST first ──
-  local -a order=() rest=()
-  while IFS= read -r _line || [[ -n "$_line" ]]; do
-    [[ -z "$_line" || "${_line:0:1}" == "#" ]] && continue
-    _split_row "$_line"
-    [[ "${ROW_RC:-1}" == 1 ]] || continue
-    tmux has-session -t "=$ROW_NAME" 2>/dev/null || continue    # only LIVE sessions (dead → `restore`)
-    if [[ "$ROW_NAME" == *"$RC_FIRST"* ]]; then order+=("$ROW_NAME"); else rest+=("$ROW_NAME"); fi
-  done < "$TSV"
-  (( ${#rest[@]} )) && order+=("${rest[@]}")
-  (( ${#order[@]} )) || { echo "rc-restore: no live rc sessions in the registry"; return 0; }
-
-  local reconnected=0 active=0 busy=0 suspect=0 gated=0 failed=0 name state n
-  for name in "${order[@]}"; do
-    state=$(_rc_state "$name")
-    if [[ "$state" == active ]]; then active=$((active+1)); _rc_reset_fail "$name"; continue; fi
-    if [[ "$state" == busy   ]]; then busy=$((busy+1)); continue; fi    # never disturb a working session
-    # dropped → hysteresis
-    n=$(_rc_bump_fail "$name")
-    if (( n < RC_FAIL_THRESHOLD )); then suspect=$((suspect+1)); _y "  suspect ($n/$RC_FAIL_THRESHOLD): ${name#cc${EM}}"; echo; continue; fi
-    if ! _gate_ok; then
-      gated=1
-      # dedup: one alert per loaded episode, not one per tick (cleared on a clean run below)
-      if [[ ! -e "$RC_STATE_DIR/gate-alerted" ]]; then
-        notify "⚠ claude-keep rc: machine loaded ($GATE_WHY) — pausing RC restore; will resume when load drops. Some sessions still without RC."
-        : > "$RC_STATE_DIR/gate-alerted"
-      fi
-      _r "  ✗ gate: $GATE_WHY — stopping"; echo; break
-    fi
-    _b "  → reconnecting: ${name#cc${EM}}"; echo
-    if _reconnect_rc "$name"; then _rc_reset_fail "$name"; reconnected=$((reconnected+1)); _g "    ✓ RC active"; echo
-    else failed=$((failed+1)); _r "    ✗ RC not confirmed"; echo; fi
-    # cap per run: leave the rest for the next tick so the npm-update load stays spread out
-    (( reconnected >= RC_MAX_PER_RUN )) && { _y "  reached max per run ($RC_MAX_PER_RUN) — rest next tick"; echo; break; }
-    sleep "$RC_PAUSE"
-  done
-  # a run that finished without tripping the gate clears the dedup flag (episode over)
-  (( gated == 0 )) && rm -f "$RC_STATE_DIR/gate-alerted" 2>/dev/null || true
-
-  echo
-  echo "rc-restore: reconnected=$reconnected already-active=$active busy=$busy suspect=$suspect failed=$failed$([[ $gated == 1 ]] && echo ' GATED')"
-}
-
-cmd_install_rc_timer() {
-  local interval=5
-  while [[ $# -gt 0 ]]; do
-    case "$1" in --interval) interval="${2:-5}"; shift ;; *) die "install-rc-timer: unknown arg '$1'" ;; esac; shift
-  done
-  local self; self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude-keep
-  local ud="$HOME/.config/systemd/user"; mkdir -p "$ud"
-  cat > "$ud/claude-keep-rc.service" <<EOF
-[Unit]
-Description=claude-session-keeper — re-establish Remote Control on live sessions
-[Service]
-Type=oneshot
-Environment=CLAUDE_KEEP_HOME=$CLAUDE_KEEP_HOME
-ExecStart=$self rc-restore
-EOF
-  cat > "$ud/claude-keep-rc.timer" <<EOF
-[Unit]
-Description=claude-session-keeper — periodic Remote Control monitor
-[Timer]
-OnBootSec=3min
-OnUnitActiveSec=${interval}min
-Persistent=true
-[Install]
-WantedBy=timers.target
-EOF
-  systemctl --user daemon-reload
-  systemctl --user enable --now claude-keep-rc.timer >/dev/null 2>&1
-  loginctl enable-linger "$USER" >/dev/null 2>&1 || true
-  _g "✓ RC monitor timer installed: every ${interval} min (+3 min after boot)"; echo
-  echo "    check:  systemctl --user list-timers claude-keep-rc.timer"
-  echo "    logs:   journalctl --user -u claude-keep-rc.service"
-}
-
-cmd_uninstall_rc_timer() {
-  local ud="$HOME/.config/systemd/user"
-  systemctl --user disable --now claude-keep-rc.timer >/dev/null 2>&1
-  rm -f "$ud/claude-keep-rc.timer" "$ud/claude-keep-rc.service"
-  systemctl --user daemon-reload
-  _g "✓ RC monitor timer removed"; echo
-}
-
-# ── transcript-location helpers (canonical: a session = <uuid>.jsonl + a cwd) ──
-# Claude stores a session's transcript at
-#   ~/.claude/projects/<cwd-with-every-"/"-replaced-by-"-">/<uuid>.jsonl
-# and `claude --resume <uuid>` looks for it in the CURRENT cwd's project dir. So a
-# session is "portable": copy its jsonl into another cwd's project dir and resume
-# from that cwd and the conversation continues there. A session that wandered into
-# a git worktree (or whose cwd was later deleted) leaves its transcript in a
-# DIFFERENT project dir than its registered cwd — that mismatch is a "drift", and
-# it's exactly what makes `restore` fail silently (resume can't find the jsonl).
-# Claude encodes the cwd by replacing EVERY non-alphanumeric char with "-" (NOT just
-# "/"): /home/me/dev/x/.foo → -home-me-dev-x--foo (the "/." becomes "--"). Verified
-# empirically (this is also what claude-session-teleport's encode_cwd does). Getting
-# this wrong (e.g. only replacing "/") mislocates the project dir for dotted paths.
 _projdir_for()    { printf '%s/%s' "$HOME/.claude/projects" "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"; }
 _find_transcript(){ ls -1 "$HOME/.claude/projects"/*/"$1.jsonl" 2>/dev/null | head -1; }
+
+# ── dialog tidying — the shared "usable state" primitive ──────────────────────
+# _tidy_pane <pane-id>: bring a session's TUI to a clean prompt. Answers a stuck
+# "Resume session?" dialog (option 2 = full, never a lossy summary), dismisses a stuck
+# Remote Control management panel (Disconnect / QR / Continue), and confirms the one-time
+# "Enable Remote Control" prompt. IDLE-GATED (never touches a mid-generation session) and
+# SAFE — it only answers/dismisses dialogs, it NEVER re-issues /remote-control (that class
+# of action is what left panels stuck in the first place). A short bounded loop so a
+# two-step dialog (Down then Enter) fully clears in one call.
+_tidy_pane() {
+  local pid="$1" pane i
+  for i in 1 2 3 4 5 6 7 8; do
+    pane=$(tmux capture-pane -p -J -t "$pid" -S -80 2>/dev/null || true)
+    grep -q 'esc to interrupt' <<<"$pane" && return 0                # busy → leave it alone
+    if grep -q 'Resume full session as-is' <<<"$pane"; then          # resume dialog → option 2 (full)
+      if grep -qE '❯.*Resume full session as-is' <<<"$pane"; then tmux send-keys -t "$pid" Enter; sleep 1
+      else tmux send-keys -t "$pid" Down; sleep 0.5; fi
+      continue
+    fi
+    if grep -qiE 'Disconnect this session|Enter to select · Esc to continue' <<<"$pane"; then
+      tmux send-keys -t "$pid" Enter; sleep 0.6; continue            # stuck RC panel → dismiss
+    fi
+    if grep -q 'Enable Remote Control' <<<"$pane"; then
+      tmux send-keys -t "$pid" Enter; sleep 0.6; continue            # one-time Enable-RC → confirm
+    fi
+    return 0                                                         # no dialog → clean
+  done
+  return 0
+}
+
+# Sweep every LIVE registered session and tidy any stuck dialog; emit one deduped
+# /login alert if the shared credential is logged out (no refresh token). Used by
+# `tidy` and folded into `restore`, so one timer keeps sessions both alive and usable.
+_do_tidy_sweep() {
+  local flag="$CLAUDE_KEEP_HOME/.login-alerted"
+  if [[ "$(_login_state)" == login-needed ]]; then
+    [[ -e "$flag" ]] || { notify "⚠ claude-keep: not logged in (no refresh token) — run: $CLAUDE auth login  (sessions run, but RC + API stay blocked)"; : > "$flag"; }
+  else rm -f "$flag" 2>/dev/null || true; fi
+  local name pid
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    [[ -z "$_line" || "${_line:0:1}" == "#" ]] && continue
+    _split_row "$_line"; name="$ROW_NAME"
+    tmux has-session -t "=$name" 2>/dev/null || continue
+    pid=$(_pane_of "$name"); [[ -n "$pid" ]] && _tidy_pane "$pid"
+  done < "$TSV"
+}
+
+cmd_tidy() {
+  ensure_registry
+  command -v tmux >/dev/null || die "tmux not installed"
+  _do_tidy_sweep
+  _g "✓ tidied live sessions (stuck resume dialogs / RC panels cleared)"; echo
+}
 
 # ──────────────────────────────────────────────────────────────────
 # doctor — audit the registry against the transcripts on disk. Flags every entry
@@ -673,7 +516,7 @@ cmd_migrate() {
 }
 
 usage() {
-  sed -n '2,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ──────────────────────────────────────────────────────────────────
@@ -686,11 +529,9 @@ main() {
     doctor|audit)     cmd_doctor "$@" ;;
     migrate)          cmd_migrate "$@" ;;
     restore)          cmd_restore "$@" ;;
-    rc-restore|rc)    cmd_rc_restore "$@" ;;
+    tidy)             cmd_tidy "$@" ;;
     install-timer)    cmd_install_timer "$@" ;;
     uninstall-timer)  cmd_uninstall_timer "$@" ;;
-    install-rc-timer)   cmd_install_rc_timer "$@" ;;
-    uninstall-rc-timer) cmd_uninstall_rc_timer "$@" ;;
     ""|help|-h|--help) usage ;;
     *) die "unknown command '$cmd' (try: claude-keep help)" ;;
   esac

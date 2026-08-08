@@ -25,7 +25,8 @@ Requires `tmux`, `claude` (logged in), and `systemd --user` (for the timer).
 claude-keep add [--no-rc] [--effort <e>]   # register THIS session (reads its own env)
 claude-keep rm [name]                      # remove THIS session, or a named one
 claude-keep ls                             # list registry + who's live
-claude-keep restore                        # re-launch everything that's down (idempotent)
+claude-keep restore                        # re-launch everything that's down, then tidy live ones
+claude-keep tidy                           # tidy LIVE sessions: clear stuck resume/RC dialogs (no relaunch)
 claude-keep install-timer [--interval M]   # systemd --user timer → restore (default 5 min)
 claude-keep uninstall-timer
 ```
