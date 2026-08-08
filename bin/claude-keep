@@ -602,7 +602,11 @@ cmd_uninstall_rc_timer() {
 # a git worktree (or whose cwd was later deleted) leaves its transcript in a
 # DIFFERENT project dir than its registered cwd — that mismatch is a "drift", and
 # it's exactly what makes `restore` fail silently (resume can't find the jsonl).
-_projdir_for()    { printf '%s/%s' "$HOME/.claude/projects" "$(printf '%s' "$1" | sed 's#/#-#g')"; }
+# Claude encodes the cwd by replacing EVERY non-alphanumeric char with "-" (NOT just
+# "/"): /home/me/dev/x/.foo → -home-me-dev-x--foo (the "/." becomes "--"). Verified
+# empirically (this is also what claude-session-teleport's encode_cwd does). Getting
+# this wrong (e.g. only replacing "/") mislocates the project dir for dotted paths.
+_projdir_for()    { printf '%s/%s' "$HOME/.claude/projects" "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"; }
 _find_transcript(){ ls -1 "$HOME/.claude/projects"/*/"$1.jsonl" 2>/dev/null | head -1; }
 
 # ──────────────────────────────────────────────────────────────────
