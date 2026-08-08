@@ -97,8 +97,8 @@ instantly on `--resume`** (the jsonl isn't where the cwd points), so it looks li
 come back up". `doctor` finds it; `migrate` (or `restore`'s auto-heal) fixes it by copying the
 transcript to a live cwd's project dir.
 
-> Moving a session to **another machine** is the same idea one level up (ship the jsonl +
-> registry row to the other host) — that's the **`claude-session-teleport`** plugin's job.
+(The same idea one level up — shipping the jsonl + registry row to *another machine* — is a
+separate concern handled by a dedicated cross-machine tool; this skill stays same-machine.)
 
 ## Notifications (optional)
 
