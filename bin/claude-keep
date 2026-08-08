@@ -12,7 +12,14 @@
 #                                      the tmux session name, $PWD, $CLAUDE_EFFORT).
 #   claude-keep rm [name]                      Remove THIS session (no arg) or a named one.
 #   claude-keep ls                             List the registry + who is live right now.
+#   claude-keep doctor                         Audit registry vs transcripts: flag DRIFT (transcript moved
+#                                      to another cwd, e.g. a git worktree), DEAD-CWD, or LOST entries —
+#                                      the ones that silently fail to resume. Read-only; suggests fixes.
+#   claude-keep migrate <session> <new-cwd>    Relocate a session's transcript to a new cwd (copy jsonl +
+#                                      repoint registry) so it resumes there — fixes a DRIFT/DEAD-CWD, or
+#                                      deliberately moves a session's working dir. Original kept as backup.
 #   claude-keep restore                        Re-launch every registered session that isn't live.
+#                                      (Auto-heals a drifted transcript; skips a lost one.)
 #   claude-keep rc-restore [--now]             Re-establish Remote Control on LIVE sessions whose RC
 #                                      dropped; alert (via $KEEP_NOTIFY_CMD) when a manual re-login is
 #                                      what's blocking it. --now skips the hysteresis (on-demand).
@@ -267,6 +274,22 @@ cmd_restore() {
     if [[ ! -d "$cwd" ]] || ! timeout 8 ls "$cwd" >/dev/null 2>&1; then
       _y "  … waiting on cwd: $name ($cwd)"; echo
       waiting=$((waiting+1)); continue
+    fi
+
+    # The transcript must sit in THIS cwd's project dir or `--resume` dies instantly
+    # (the session then looks like it "won't come up"). Auto-heal a DRIFTED transcript
+    # (session wandered into a git worktree, cwd later deleted, …) by copying it into
+    # place; skip a truly LOST one instead of launching a doomed resume. (See `doctor`.)
+    local _expect; _expect="$(_projdir_for "$cwd")/$uuid.jsonl"
+    if [[ ! -f "$_expect" ]]; then
+      local _drift; _drift="$(_find_transcript "$uuid")"
+      if [[ -n "$_drift" ]]; then
+        mkdir -p "$(dirname "$_expect")"; cp "$_drift" "$_expect"
+        _y "  ↪ healed drift: $name (transcript ← ${_drift%/*})"; echo
+      else
+        _r "  ✗ no transcript for $name (${uuid:0:8}…) — skipping (run: claude-keep doctor)"; echo
+        continue
+      fi
     fi
 
     local launch="$CLAUDE --dangerously-skip-permissions --resume $uuid"
@@ -570,8 +593,83 @@ cmd_uninstall_rc_timer() {
   _g "✓ RC monitor timer removed"; echo
 }
 
+# ── transcript-location helpers (canonical: a session = <uuid>.jsonl + a cwd) ──
+# Claude stores a session's transcript at
+#   ~/.claude/projects/<cwd-with-every-"/"-replaced-by-"-">/<uuid>.jsonl
+# and `claude --resume <uuid>` looks for it in the CURRENT cwd's project dir. So a
+# session is "portable": copy its jsonl into another cwd's project dir and resume
+# from that cwd and the conversation continues there. A session that wandered into
+# a git worktree (or whose cwd was later deleted) leaves its transcript in a
+# DIFFERENT project dir than its registered cwd — that mismatch is a "drift", and
+# it's exactly what makes `restore` fail silently (resume can't find the jsonl).
+_projdir_for()    { printf '%s/%s' "$HOME/.claude/projects" "$(printf '%s' "$1" | sed 's#/#-#g')"; }
+_find_transcript(){ ls -1 "$HOME/.claude/projects"/*/"$1.jsonl" 2>/dev/null | head -1; }
+
+# ──────────────────────────────────────────────────────────────────
+# doctor — audit the registry against the transcripts on disk. Flags every entry
+# that can't be resumed as-registered: transcript DRIFTED to another cwd, the cwd
+# is gone (DEAD-CWD), or the transcript is LOST. These are the sessions that die
+# silently on `restore`. Read-only; suggests the fix per row.
+cmd_doctor() {
+  ensure_registry
+  local total=0 ok=0 drift=0 lost=0 deadcwd=0
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    [[ -z "$_line" || "${_line:0:1}" == "#" ]] && continue
+    _split_row "$_line"
+    local uuid="$ROW_UUID" cwd="$ROW_CWD" title="${ROW_NAME#cc${EM}}"
+    total=$((total+1))
+    local found
+    if [[ -f "$(_projdir_for "$cwd")/$uuid.jsonl" ]]; then
+      if [[ -d "$cwd" ]]; then ok=$((ok+1)); continue; fi
+      deadcwd=$((deadcwd+1)); _y "  DEAD-CWD"; echo "  $title — cwd gone ($cwd) → migrate to a live cwd"
+      continue
+    fi
+    found="$(_find_transcript "$uuid")"
+    if [[ -n "$found" ]]; then
+      drift=$((drift+1)); _y "  DRIFT   "; echo "  $title — transcript in $(basename "$(dirname "$found")") (registered cwd stale) → migrate"
+    else
+      lost=$((lost+1)); _r "  LOST    "; echo "  $title — no ${uuid:0:8}….jsonl anywhere → dead entry"
+    fi
+  done < "$TSV"
+  echo
+  echo "  $ok ok · $drift drift · $deadcwd dead-cwd · $lost lost   (of $total)"
+  (( drift + deadcwd > 0 )) && echo "  → fix:    claude-keep migrate <session> <new-cwd>"
+  (( lost > 0 ))            && echo "  → remove: claude-keep rm <session>   (lost entries are unresumable)"
+  return 0   # a clean audit must not exit non-zero (the (( )) above would otherwise leak false)
+}
+
+# ──────────────────────────────────────────────────────────────────
+# migrate <session> <new-cwd> — relocate a registered session's transcript to a new
+# cwd (copy the jsonl into that cwd's project dir + repoint the registry) so it resumes
+# there. For a DRIFT/DEAD-CWD entry from `doctor`, or to deliberately move a session's
+# working directory. Copies (never moves) — the original jsonl stays as a backup.
+cmd_migrate() {
+  ensure_registry
+  local q="${1:-}" newcwd="${2:-}"
+  [[ -n "$q" && -n "$newcwd" ]] || die "usage: claude-keep migrate <session> <new-cwd>"
+  local row name uuid
+  row="$(awk -F'\t' -v q="$q" 'index($1,q)>0 {print; exit}' "$TSV")"
+  [[ -n "$row" ]] || die "no registered session matching '$q'"
+  name="$(cut -f1 <<<"$row")"; uuid="$(cut -f2 <<<"$row")"
+  local src; src="$(_find_transcript "$uuid")"
+  [[ -n "$src" ]] || die "no transcript ${uuid:0:8}… found anywhere — nothing to migrate (LOST entry)"
+  local dstdir; dstdir="$(_projdir_for "$newcwd")"
+  mkdir -p "$dstdir"
+  cp "$src" "$dstdir/$uuid.jsonl"
+  local tmp; tmp="$(mktemp)"
+  awk -F'\t' -v OFS='\t' -v n="$name" -v c="$newcwd" '$1==n{$3=c} {print}' "$TSV" > "$tmp" && mv "$tmp" "$TSV"
+  _g "✓ migrated: ${name#cc${EM}} → $newcwd"; echo
+  echo "  transcript: $src"
+  echo "           → $dstdir/$uuid.jsonl   (original kept as backup)"
+  if tmux has-session -t "=$name" 2>/dev/null; then
+    _y "  note: it's LIVE at the old cwd — kill that tmux + run 'claude-keep restore' to move it"; echo
+  else
+    echo "  not live → 'claude-keep restore' brings it up at the new cwd"
+  fi
+}
+
 usage() {
-  sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ──────────────────────────────────────────────────────────────────
@@ -581,6 +679,8 @@ main() {
     add)              cmd_add "$@" ;;
     rm|remove)        cmd_rm "$@" ;;
     ls|list|status)   cmd_ls "$@" ;;
+    doctor|audit)     cmd_doctor "$@" ;;
+    migrate)          cmd_migrate "$@" ;;
     restore)          cmd_restore "$@" ;;
     rc-restore|rc)    cmd_rc_restore "$@" ;;
     install-timer)    cmd_install_timer "$@" ;;

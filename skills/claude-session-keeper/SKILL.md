@@ -35,7 +35,9 @@ Model is **not** stored — `claude --resume` restores the session's own model.
 | `claude-keep add [--no-rc] [--effort <e>]` | Register THIS session. `--no-rc` = plain tmux session (don't re-enable Remote Control on restore). |
 | `claude-keep rm [name]` | Remove THIS session (no arg) or a named one. Accepts the bare title (`yango`) or full tmux name (`cc—dev-serv-in/yango`). |
 | `claude-keep ls` | List the registry + who is live right now. |
-| `claude-keep restore` | Re-launch every registered session that isn't live. Idempotent. |
+| `claude-keep doctor` | Audit the registry against the transcripts on disk. Flags **DRIFT** (the `<uuid>.jsonl` moved to another cwd's project dir — e.g. the session wandered into a git worktree), **DEAD-CWD** (cwd deleted), and **LOST** (no transcript anywhere). These are the entries that silently fail to resume. Read-only; suggests the fix per row. |
+| `claude-keep migrate <session> <new-cwd>` | Relocate a session's transcript to `<new-cwd>` (copy its `<uuid>.jsonl` into that cwd's project dir + repoint the registry) so it resumes there. Fixes a DRIFT/DEAD-CWD, or deliberately moves a session's working dir. **Copies** (original kept as backup). |
+| `claude-keep restore` | Re-launch every registered session that isn't live. Idempotent. **Auto-heals a drifted transcript** (copies it into the registered cwd's project dir) and **skips a lost one** instead of launching a doomed `--resume`. |
 | `claude-keep rc-restore [--now]` | Re-establish **Remote Control** on LIVE sessions whose RC channel dropped (it just re-issues `/remote-control` into the existing pane — no relaunch). Alerts via `$KEEP_NOTIFY_CMD` if a manual re-login is what's blocking it. `--now` skips the hysteresis. |
 | `claude-keep install-timer [--interval M]` | Install a systemd --user timer (default 5 min) that runs `restore`. |
 | `claude-keep uninstall-timer` | Remove the restore timer. |
@@ -71,6 +73,32 @@ no relaunch. Guardrails, learned the hard way scraping a TUI:
   *access* token is normal — it refreshes on use — so that alone is never treated as login-needed.
 
 Run it on a timer with `install-rc-timer` for unattended Remote Control monitoring.
+
+## Session migration — the transcript is portable (canonical)
+
+A Claude Code session is just two things:
+
+1. its **transcript** — `~/.claude/projects/<cwd-encoded>/<uuid>.jsonl`, where `<cwd-encoded>`
+   is the working directory with **every `/` replaced by `-`** (`/home/me/dev` →
+   `-home-me-dev`); and
+2. a **cwd** it was launched from.
+
+`claude --resume <uuid>` looks for `<uuid>.jsonl` **in the current cwd's project dir**. So a
+session is *relocatable*: **copy its jsonl into another cwd's project dir, then
+`claude --resume` from that cwd**, and the same conversation continues there. The registry
+just needs its `cwd` column repointed. That's the whole trick behind `migrate` — and behind
+recovering a session whose cwd vanished.
+
+**Drift** is when the transcript and the registered cwd disagree — the `<uuid>.jsonl` lives in
+a *different* project dir than the cwd says. It happens when a session **wanders into a git
+worktree** (Claude re-homes the transcript to the worktree's project dir) and the worktree is
+later auto-deleted, or when the cwd is otherwise moved/removed. A drifted session **dies
+instantly on `--resume`** (the jsonl isn't where the cwd points), so it looks like it "won't
+come back up". `doctor` finds it; `migrate` (or `restore`'s auto-heal) fixes it by copying the
+transcript to a live cwd's project dir.
+
+> Moving a session to **another machine** is the same idea one level up (ship the jsonl +
+> registry row to the other host) — that's the **`claude-session-teleport`** plugin's job.
 
 ## Notifications (optional)
 
