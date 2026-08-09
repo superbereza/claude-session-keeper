@@ -4,6 +4,7 @@ See docs/superpowers/specs/2026-08-09-session-state-engine-design.md. The parse_
 derive_health/decide functions take strings/dicts and return dicts/strings — no file, tmux, or
 subprocess access. All I/O lives in gather()/main() at the bottom.
 """
+import json
 import re
 
 _RULE = re.compile(r"^\s*─{5,}\s*$")                  # a horizontal rule line (≥5 box dashes)
@@ -72,3 +73,24 @@ def parse_pane(text):
 
     return {"state": state, "rc_footer": rc_footer, "composer": composer,
             "banners": banners, "last_gen": last_gen}
+
+
+def parse_state(json_text):
+    """Read a ~/.claude/sessions/<pid>.json body. Only bridge PRESENCE is trusted (an absent
+    bridgeSessionId is authoritative; a present one can be stale). Garbage → all-unknown."""
+    try:
+        d = json.loads(json_text)
+        if not isinstance(d, dict):
+            raise ValueError
+    except Exception:
+        return {"status": "unknown", "rc_bridge": "absent", "pid": None,
+                "cwd_actual": None, "session_id": None}
+    status = d.get("status")
+    status = status if status in ("idle", "busy") else "unknown"
+    return {
+        "status": status,
+        "rc_bridge": "present" if d.get("bridgeSessionId") else "absent",
+        "pid": d.get("pid") if isinstance(d.get("pid"), int) else None,
+        "cwd_actual": d.get("cwd") or None,
+        "session_id": d.get("sessionId") or None,
+    }
