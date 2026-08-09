@@ -52,6 +52,24 @@ Sources feed the engine; the engine emits one record per session; policies act o
   TUI pane parse ─┘                               rc-heal  → RC down      → /remote-control
 ```
 
+### One heal loop for ALL recovery (the point of unifying)
+
+Today there are **three separate sweeps**, each re-detecting state its own way: `restore`
+(tmux liveness), `_tidy_pane` (dialog greps), `_state_for` (bridge). They don't agree — which
+is the direct cause of past bugs (a command *echo* read as stuck input; a bare `/rc` read as a
+live channel). The engine collapses them into a **single pass**:
+
+```
+gather() → [records] → for each: act(decide(record))
+```
+
+`decide` already covers every recovery type — a crashed session, a stuck dialog, a drifted
+transcript, a dropped RC — as rows in one table (below). The win isn't new actions (relaunch /
+tidy / migrate already exist); it's that **detection and the guardrails live in one tested
+place**: one idle-gate for everything (never touch `busy`), one drift check, no contradictory
+screen reads. `restore` and `tidy` remain as thin CLI wrappers that filter the same loop to a
+subset of action types, so the surface is unchanged while the brain is shared.
+
 ## The per-session record
 
 ```
@@ -160,6 +178,13 @@ otherwise                                              → none
 
 `reissue-rc` also requires the pane not show `esc to interrupt` (a second idle-gate beyond
 state-file `status`), matching current behavior.
+
+**`drift → migrate` is a deliberate auto-heal choice.** `migrate` *copies* the transcript into
+the registered cwd's project dir (semi-invasive but non-destructive — the original is kept).
+`restore` already does exactly this auto-heal today, so routing drift through `decide` preserves
+current behavior. Flagged here so it's a conscious switch: if auto-migrate ever feels too eager,
+flip this row to `flag` (report via `doctor`, act only on explicit `migrate`) — a one-line change
+in `decide`, with a test either way.
 
 ## The footer-semantics experiment (blocks the `present+rc → down` rule)
 
