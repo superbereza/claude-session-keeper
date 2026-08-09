@@ -577,7 +577,7 @@ main() {
   case "$cmd" in
     add)              cmd_add "$@" ;;
     rm|remove)        cmd_rm "$@" ;;
-    ls|list|status)   cmd_ls "$@" ;;
+    ls|list)          cmd_ls "$@" ;;
     doctor|audit)     cmd_doctor "$@" ;;
     migrate)          cmd_migrate "$@" ;;
     restore)          cmd_restore "$@" ;;
