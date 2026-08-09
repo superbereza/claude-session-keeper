@@ -1,0 +1,7 @@
+✢ Working… (43s · ↓ 2.1k tokens)
+  ✘ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai/claude-co…
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ctrl+t to…
+                                                                            /rc

@@ -1,0 +1,5 @@
+✻ Crunched for 1m 6s
+────────────────────────────────────────────────────────────────────────────────
+❯ how do I refresh the token when it expires?
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents              /rc

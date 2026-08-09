@@ -1,0 +1,9 @@
+✻ Crunched for 6s
+
+❯ /remote-control MACHINE/SESSION
+  ⎿  /rc connecting…
+  ✘ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai/claude-co…
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents              /rc

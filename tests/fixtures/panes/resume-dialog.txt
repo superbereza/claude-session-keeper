@@ -1,0 +1,10 @@
+ Resume session?
+
+   1. Resume with a summary of the conversation so far
+ ❯ 2. Resume full session as-is
+
+   Enter to select · Esc to cancel
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents              /rc
