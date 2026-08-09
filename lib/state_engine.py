@@ -135,13 +135,21 @@ def merge(reg, live, state, tui):
     }
 
 
-FOOTER_DROP_CONFIRMED = False   # flip to True only after the /rc-vs-/rc-active experiment
+# EXPERIMENT 2026-08-10 — REJECTED. We attached a real mobile viewer to a bridged session and even
+# steered it from the phone; the terminal footer stayed a bare "/rc" the whole time — idle, busy,
+# viewer-attached, viewer-active — and "/rc active" never appeared. So the footer is a static
+# "RC enabled" indicator, NOT a live connection/viewer state: it cannot distinguish a live bridge
+# from a silently-dropped one. This stays False permanently (a silent RC drop is not locally
+# detectable — there is no RC-state API; see the guide-agent findings in the design spec). We act
+# ONLY on bridge ABSENCE, never on the footer. Left here as a gate so the dead-end isn't re-tried.
+FOOTER_DROP_CONFIRMED = False
 
 
 def derive_health(record):
     """Remote Control health from the record. Bridge ABSENCE is authoritative → down. A present
-    bridge is up only if the footer confirms 'active'; a bare '/rc' silent-drop stays 'unknown'
-    until the footer experiment validates it (then FOOTER_DROP_CONFIRMED gates it to 'down')."""
+    bridge is 'up' only if the footer says 'active' — but note that footer never actually appears
+    in practice (see EXPERIMENT above), so a present bridge with a bare '/rc' resolves to 'unknown'
+    (we neither trust it as up nor act on it as down). Only absence drives an action."""
     if record.get("rc_bridge") == "absent":
         return "down"
     if record.get("rc_footer") == "active":
