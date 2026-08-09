@@ -1,6 +1,6 @@
 import unittest
 
-from lib.state_engine import merge
+from lib.state_engine import merge, encode_cwd
 
 REG = {"name": "cc—x/proj", "uuid": "u1", "cwd_registered": "/home/me/dev/proj",
        "effort": "", "rc_desired": True, "pane_id": "%3"}
@@ -24,17 +24,28 @@ class TestMerge(unittest.TestCase):
         tui = dict(TUI, state="resume-dialog")
         self.assertEqual(merge(REG, True, STATE, tui)["dialog"], "resume")
 
-    def test_drift_when_cwd_differs(self):
-        st = dict(STATE, cwd_actual="/home/me/dev/other")
-        self.assertTrue(merge(REG, True, st, TUI)["drift"])
+    def test_drift_is_passthrough_from_caller(self):
+        # drift is I/O-derived (gather checks the transcript location) and passed in via reg;
+        # a wandering live cwd must NOT by itself mark drift.
+        self.assertTrue(merge(dict(REG, drift=True), True, STATE, TUI)["drift"])
+        self.assertFalse(merge(dict(REG, drift=False), True, STATE, TUI)["drift"])
 
-    def test_worktree_cwd_is_not_drift(self):
+    def test_wandering_live_cwd_is_not_drift(self):
         st = dict(STATE, cwd_actual="/home/me/dev/proj/.claude/worktrees/x")
-        self.assertFalse(merge(REG, True, st, TUI)["drift"])   # worktree cwd is expected, not drift
+        self.assertFalse(merge(REG, True, st, TUI)["drift"])   # no drift flag from caller → not drift
 
     def test_tui_busy_overrides_idle_statefile(self):
         tui = dict(TUI, state="busy")                          # pane shows 'esc to interrupt'
         self.assertEqual(merge(REG, True, STATE, tui)["status"], "busy")  # even though state file says idle
+
+
+class TestEncodeCwd(unittest.TestCase):
+    def test_every_nonalnum_becomes_dash(self):
+        self.assertEqual(encode_cwd("/home/me/dev/ai-auth-lib"), "-home-me-dev-ai-auth-lib")
+
+    def test_worktree_path_encoding(self):
+        self.assertEqual(encode_cwd("/home/me/dev/proj/.claude/worktrees/x"),
+                         "-home-me-dev-proj--claude-worktrees-x")   # '.' → '-', so '/.claude' → '--claude'
 
 
 if __name__ == "__main__":

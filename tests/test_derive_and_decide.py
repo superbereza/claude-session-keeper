@@ -38,8 +38,10 @@ class TestDecide(unittest.TestCase):
     def test_dead_session_relaunched(self):
         self.assertEqual(decide(rec(live=False)), "relaunch")
 
-    def test_drift_migrates(self):
-        self.assertEqual(decide(rec(drift=True)), "migrate")
+    def test_live_drift_is_flag_only_not_migrate(self):
+        # migrating a live session would copy a transcript it's still writing → later restore
+        # resumes the stale copy and loses work. So live drift is surfaced, never auto-acted.
+        self.assertEqual(decide(rec(drift=True, rc_bridge="present", rc_footer="active")), "none")
 
     def test_stuck_dialog_tidied(self):
         self.assertEqual(decide(rec(dialog="resume")), "tidy")

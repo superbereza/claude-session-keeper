@@ -100,15 +100,23 @@ _DIALOG = {"resume-dialog": "resume", "rc-panel": "rc-panel",
            "enable-rc": "enable-rc", "login-needed": "login"}
 
 
+def encode_cwd(path):
+    """Claude's project-dir encoding: EVERY non-alphanumeric char → '-' (lossy by design).
+    /home/me/dev/ai-auth-lib → -home-me-dev-ai-auth-lib. Pure; used to locate a transcript."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path or "")
+
+
 def merge(reg, live, state, tui):
     """Combine registry row + tmux liveness + state-file + TUI parse into one record.
 
     Record keys are FIXED (later tasks depend on these exact spellings). rc_health is left
-    'unknown' here — derive_health fills it. A cwd under .claude/worktrees/ is expected, not drift.
+    'unknown' here — derive_health fills it. `drift` is an I/O-derived signal computed by the
+    caller (gather: is the transcript in the registered cwd's project dir?) — NOT the live cwd,
+    which wanders normally (subdirs, worktrees) without breaking resume.
     """
     cwd_reg = reg.get("cwd_registered")
     cwd_act = state.get("cwd_actual")
-    drift = bool(cwd_act and "/.claude/worktrees/" not in cwd_act and cwd_act != cwd_reg)
+    drift = bool(reg.get("drift"))
     # status is busy if EITHER signal says so (double idle-gate): the state file OR a live
     # 'esc to interrupt' pane. So an action never fires on a session either source calls busy.
     status = "busy" if tui.get("state") == "busy" else state.get("status", "unknown")
@@ -144,19 +152,23 @@ def derive_health(record):
 
 
 def decide(record):
-    """One action per record. Order encodes the guardrails; first match wins."""
+    """One action per record. Order encodes the guardrails; first match wins.
+
+    NB `drift` (transcript not in the registered cwd's project dir) is a FLAG, not an auto-action:
+    migrating a LIVE session would copy a transcript it's still appending to, so a later restore
+    would resume the STALE copy and lose work. Dead-session drift is healed inline by restore's
+    relaunch. So decide surfaces drift in the record (for status/doctor) but never auto-migrates.
+    """
     if record.get("status") == "busy":
         return "none"                              # never interrupt a working session
     if not record.get("live"):
-        return "relaunch"
-    if record.get("drift"):
-        return "migrate"
+        return "relaunch"                          # dead → relaunch (restore auto-heals any drift inline)
     if record.get("dialog") in ("resume", "rc-panel", "enable-rc"):
         return "tidy"
     if record.get("rc_desired") and record.get("logged_in", True) \
             and record.get("status") == "idle" and derive_health(record) == "down":
         return "reissue-rc"
-    return "none"                                  # incl. rc_health up/unknown, rc_desired False
+    return "none"                                  # incl. live-drift (flag only), rc up/unknown, rc=0
 
 
 # ── impure shell: gather() reads the world and feeds strings to the pure core ────────────────
@@ -212,6 +224,13 @@ def _pane_of(name):
     return None
 
 
+def _transcript_in_place(uuid, cwd_registered):
+    """Real drift check (I/O): does <uuid>.jsonl live in the REGISTERED cwd's project dir? If not,
+    `claude --resume` from that cwd dies instantly. Mirrors doctor's definition."""
+    projdir = os.path.join(os.path.expanduser("~/.claude/projects"), encode_cwd(cwd_registered))
+    return os.path.isfile(os.path.join(projdir, "%s.jsonl" % uuid))
+
+
 def gather():
     """Read the registry + state files + tmux panes → one record per registered session."""
     home = os.environ.get("CLAUDE_KEEP_HOME", os.path.expanduser("~/.claude-keep"))
@@ -220,6 +239,7 @@ def gather():
     for reg in _read_registry(os.path.join(home, "sessions.tsv")):
         pane = _pane_of(reg["name"])
         reg["pane_id"] = pane
+        reg["drift"] = not _transcript_in_place(reg["uuid"], reg["cwd_registered"])
         if pane:
             tui = parse_pane(_run("tmux", "capture-pane", "-p", "-J", "-t", pane, "-S", "-80"))
         else:
