@@ -122,3 +122,35 @@ def merge(reg, live, state, tui):
         "cwd_actual": cwd_act, "drift": drift,
         "banners": tui.get("banners", []), "last_gen": tui.get("last_gen"),
     }
+
+
+FOOTER_DROP_CONFIRMED = False   # flip to True only after the /rc-vs-/rc-active experiment
+
+
+def derive_health(record):
+    """Remote Control health from the record. Bridge ABSENCE is authoritative → down. A present
+    bridge is up only if the footer confirms 'active'; a bare '/rc' silent-drop stays 'unknown'
+    until the footer experiment validates it (then FOOTER_DROP_CONFIRMED gates it to 'down')."""
+    if record.get("rc_bridge") == "absent":
+        return "down"
+    if record.get("rc_footer") == "active":
+        return "up"
+    if FOOTER_DROP_CONFIRMED and record.get("rc_footer") == "rc":
+        return "down"
+    return "unknown"
+
+
+def decide(record):
+    """One action per record. Order encodes the guardrails; first match wins."""
+    if record.get("status") == "busy":
+        return "none"                              # never interrupt a working session
+    if not record.get("live"):
+        return "relaunch"
+    if record.get("drift"):
+        return "migrate"
+    if record.get("dialog") in ("resume", "rc-panel", "enable-rc"):
+        return "tidy"
+    if record.get("rc_desired") and record.get("logged_in", True) \
+            and record.get("status") == "idle" and derive_health(record) == "down":
+        return "reissue-rc"
+    return "none"                                  # incl. rc_health up/unknown, rc_desired False
