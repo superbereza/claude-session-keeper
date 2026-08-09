@@ -94,3 +94,31 @@ def parse_state(json_text):
         "cwd_actual": d.get("cwd") or None,
         "session_id": d.get("sessionId") or None,
     }
+
+
+_DIALOG = {"resume-dialog": "resume", "rc-panel": "rc-panel",
+           "enable-rc": "enable-rc", "login-needed": "login"}
+
+
+def merge(reg, live, state, tui):
+    """Combine registry row + tmux liveness + state-file + TUI parse into one record.
+
+    Record keys are FIXED (later tasks depend on these exact spellings). rc_health is left
+    'unknown' here — derive_health fills it. A cwd under .claude/worktrees/ is expected, not drift.
+    """
+    cwd_reg = reg.get("cwd_registered")
+    cwd_act = state.get("cwd_actual")
+    drift = bool(cwd_act and "/.claude/worktrees/" not in cwd_act and cwd_act != cwd_reg)
+    return {
+        "name": reg.get("name"), "uuid": reg.get("uuid"),
+        "cwd_registered": cwd_reg, "effort": reg.get("effort", ""),
+        "rc_desired": bool(reg.get("rc_desired")),
+        "live": bool(live), "pane_id": reg.get("pane_id"),
+        "pid": state.get("pid"), "status": state.get("status", "unknown"),
+        "rc_bridge": state.get("rc_bridge", "absent"),
+        "rc_footer": tui.get("rc_footer", "none"), "rc_health": "unknown",
+        "dialog": _DIALOG.get(tui.get("state"), "none"),
+        "composer": tui.get("composer", "unknown"),
+        "cwd_actual": cwd_act, "drift": drift,
+        "banners": tui.get("banners", []), "last_gen": tui.get("last_gen"),
+    }
