@@ -12,7 +12,9 @@ The skill is wired up for several coding agents from one source:
 - **Gemini** — reads this file (`gemini-extension.json` → `contextFileName: AGENTS.md`).
 - Full, authoritative usage: [`skills/claude-session-keeper/SKILL.md`](skills/claude-session-keeper/SKILL.md).
 
-Requires `tmux`, `claude` (logged in), and `systemd --user` (for the timer).
+Requires `tmux`, `claude` (logged in), and `systemd --user` (for the timer). `python3` is used for
+the state engine (`status` + the RC-heal decision); without it the keeper still restores/tidies,
+just skips RC re-establishment.
 
 ## Invoking the CLI
 
@@ -27,6 +29,7 @@ claude-keep rm [name]                      # remove THIS session, or a named one
 claude-keep ls                             # list registry + who's live
 claude-keep restore                        # re-launch everything that's down, then tidy live ones
 claude-keep tidy                           # tidy LIVE sessions: clear stuck resume/RC dialogs (no relaunch)
+claude-keep status                         # per-session records as JSON (state engine: registry+tmux+state-file+TUI)
 claude-keep install-timer [--interval M]   # systemd --user timer → restore (default 5 min)
 claude-keep uninstall-timer
 ```
