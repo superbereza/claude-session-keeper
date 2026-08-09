@@ -432,30 +432,10 @@ _tidy_pane() {
   return 0
 }
 
-# Read the LIVE session-state file for a uuid: ~/.claude/sessions/<pid>.json — an UNDOCUMENTED
-# but authoritative index Claude Code writes per running process (keyed by pid, carrying the
-# sessionId). We use only its RELIABLE facts: `status` (idle|busy) and the PRESENCE of
-# `bridgeSessionId` (a Remote Control registration exists). Its ABSENCE is trustworthy ("RC not
-# registered"); its PRESENCE is NOT proof of a live channel — the field can go stale on a silent
-# bridge death (upstream anthropics/claude-code #78878, #57715) — so we act only on absence, never
-# tear down or re-issue on a present one. Echoes "<status>\t<bridge:0|1>"; returns 1 if no state
-# file exists for this uuid (older claude / changed layout → caller leaves RC alone). Flat JSON, so
-# sed/grep on a newline-stripped copy is enough; this is a best-effort accelerator, not a contract.
-_state_for() {
-  local uuid="$1" f flat sid status bridge
-  for f in "$HOME/.claude/sessions"/*.json; do
-    [[ -f "$f" ]] || continue
-    flat=$(tr -d '\n' < "$f" 2>/dev/null) || continue
-    sid=$(sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$flat")
-    [[ "$sid" == "$uuid" ]] || continue
-    status=$(sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$flat")
-    bridge=0; grep -q '"bridgeSessionId"[[:space:]]*:[[:space:]]*"[^"]' <<<"$flat" && bridge=1
-    printf '%s\t%s\n' "${status:-unknown}" "$bridge"
-    return 0
-  done
-  return 1
-}
-
+# The per-session RC/idle facts that used to be scraped here (`_state_for`) now come from the
+# tested Python engine — see lib/state_engine.py (parse_state → bridge presence + status) and
+# `_engine decide-all` below, which merges them with the parsed pane and returns one action.
+#
 # Sweep every LIVE registered session: tidy any stuck dialog, RE-ESTABLISH Remote Control when the
 # state file says its bridge is genuinely ABSENT, and emit one deduped /login alert when the shared
 # credential is logged out. Folded into `restore`, so one timer keeps sessions alive AND reachable.
@@ -465,28 +445,32 @@ _do_tidy_sweep() {
   if [[ "$login" == login-needed ]]; then
     [[ -e "$flag" ]] || { notify "⚠ claude-keep: not logged in (no refresh token) — run: $CLAUDE auth login  (sessions run, but RC + API stay blocked)"; : > "$flag"; }
   else rm -f "$flag" 2>/dev/null || true; fi
-  local name pid rc uuid title st status bridge
+
+  # RC-heal decisions come from the TESTED engine (lib/state_engine.py `decide`), computed ONCE
+  # for the whole fleet (a single gather, not one per session). decide returns reissue-rc only for
+  # an rc_desired, logged-in, idle session whose RC is genuinely down (bridge absent) — the one
+  # signal that can't false-positive the way the `/rc` footer scrape did. Empty if python3 is
+  # absent → we still tidy, just skip RC re-establishment (graceful degradation).
+  local _decisions=""
+  if command -v python3 >/dev/null; then
+    local _lo=""; [[ "$login" == login-needed ]] && _lo="--logged-out"
+    _decisions=$(_engine decide-all $_lo 2>/dev/null || true)
+  fi
+
+  local name pid uuid title action
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     [[ -z "$_line" || "${_line:0:1}" == "#" ]] && continue
-    _split_row "$_line"; name="$ROW_NAME"; uuid="$ROW_UUID"; rc="${ROW_RC:-1}"; title="${name#cc${EM}}"
+    _split_row "$_line"; name="$ROW_NAME"; uuid="$ROW_UUID"; title="${name#cc${EM}}"
     tmux has-session -t "=$name" 2>/dev/null || continue
     pid=$(_pane_of "$name"); [[ -z "$pid" ]] && continue
 
     _tidy_pane "$pid"     # first: answer a resume dialog / dismiss a stuck panel → clean prompt
 
-    # Re-establish Remote Control ONLY when the authoritative state file says the bridge is ABSENT
-    # (RC never came up, or was torn down) — the one signal that cannot false-positive the way the
-    # `/rc` footer scrape did. Gated on: an rc session, logged in (else the /login alert above is the
-    # real fix), state says idle AND the pane isn't mid-generation. A PRESENT bridge is left untouched
-    # (it may be stale, but re-issuing a live session is exactly what left management panels stuck).
-    if [[ "$rc" == "1" && "$login" == ok ]] && st=$(_state_for "$uuid"); then
-      status="${st%%$'\t'*}"; bridge="${st##*$'\t'}"
-      if [[ "$bridge" == "0" && "$status" == "idle" ]] \
-         && ! tmux capture-pane -p -J -t "$pid" -S -6 2>/dev/null | grep -q 'esc to interrupt'; then
-        tmux send-keys -t "$pid" "/remote-control ${title}"; sleep 0.4; tmux send-keys -t "$pid" Enter
-        notify "ℹ claude-keep: re-issued /remote-control for '$name' (Remote Control bridge was absent)"
-        sleep 1; _tidy_pane "$pid"   # confirm the one-time Enable-RC prompt if it appears
-      fi
+    action=$(awk -F'\t' -v u="$uuid" '$1==u{print $2; exit}' <<<"$_decisions")
+    if [[ "$action" == "reissue-rc" ]]; then
+      tmux send-keys -t "$pid" "/remote-control ${title}"; sleep 0.4; tmux send-keys -t "$pid" Enter
+      notify "ℹ claude-keep: re-issued /remote-control for '$name' (Remote Control bridge was absent)"
+      sleep 1; _tidy_pane "$pid"   # confirm the one-time Enable-RC prompt if it appears
     fi
   done < "$TSV"
 }

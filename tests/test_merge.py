@@ -32,6 +32,10 @@ class TestMerge(unittest.TestCase):
         st = dict(STATE, cwd_actual="/home/me/dev/proj/.claude/worktrees/x")
         self.assertFalse(merge(REG, True, st, TUI)["drift"])   # worktree cwd is expected, not drift
 
+    def test_tui_busy_overrides_idle_statefile(self):
+        tui = dict(TUI, state="busy")                          # pane shows 'esc to interrupt'
+        self.assertEqual(merge(REG, True, STATE, tui)["status"], "busy")  # even though state file says idle
+
 
 if __name__ == "__main__":
     unittest.main()

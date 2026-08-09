@@ -109,12 +109,15 @@ def merge(reg, live, state, tui):
     cwd_reg = reg.get("cwd_registered")
     cwd_act = state.get("cwd_actual")
     drift = bool(cwd_act and "/.claude/worktrees/" not in cwd_act and cwd_act != cwd_reg)
+    # status is busy if EITHER signal says so (double idle-gate): the state file OR a live
+    # 'esc to interrupt' pane. So an action never fires on a session either source calls busy.
+    status = "busy" if tui.get("state") == "busy" else state.get("status", "unknown")
     return {
         "name": reg.get("name"), "uuid": reg.get("uuid"),
         "cwd_registered": cwd_reg, "effort": reg.get("effort", ""),
         "rc_desired": bool(reg.get("rc_desired")),
         "live": bool(live), "pane_id": reg.get("pane_id"),
-        "pid": state.get("pid"), "status": state.get("status", "unknown"),
+        "pid": state.get("pid"), "status": status,
         "rc_bridge": state.get("rc_bridge", "absent"),
         "rc_footer": tui.get("rc_footer", "none"), "rc_health": "unknown",
         "dialog": _DIALOG.get(tui.get("state"), "none"),
@@ -231,6 +234,12 @@ def main(argv):
     if argv[:1] == ["status"]:
         print(json.dumps(gather(), indent=2, ensure_ascii=False))
         return 0
+    if argv[:1] == ["decide-all"]:
+        logged_in = "--logged-out" not in argv
+        for r in gather():                       # one gather for the whole fleet
+            r["logged_in"] = logged_in
+            print("%s\t%s" % (r["uuid"], decide(r)))
+        return 0
     if argv[:1] == ["decide-one"] and len(argv) >= 2:
         uuid = argv[1]
         logged_in = "--logged-out" not in argv
@@ -241,7 +250,7 @@ def main(argv):
                 return 0
         print("none")
         return 0
-    print("usage: state_engine.py status | decide-one <uuid> [--logged-out]")
+    print("usage: state_engine.py status | decide-all [--logged-out] | decide-one <uuid> [--logged-out]")
     return 2
 
 
