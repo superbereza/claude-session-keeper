@@ -25,6 +25,8 @@
 #                                      RE-ESTABLISH Remote Control when its bridge is genuinely absent (read
 #                                      from ~/.claude/sessions/<pid>.json, not the flaky /rc footer), and
 #                                      alert (via $KEEP_NOTIFY_CMD) if the shared login is logged out.
+#   claude-keep status                         Print the state engine's per-session records as JSON
+#                                      (registry + tmux + ~/.claude/sessions state + parsed TUI, merged).
 #   claude-keep install-timer [--interval M]   Install a systemd --user timer (default 5 min) → restore (+tidy).
 #   claude-keep uninstall-timer                Remove the restore timer.
 #
@@ -559,8 +561,14 @@ cmd_migrate() {
   fi
 }
 
+# ── state engine bridge (pure Python core; see lib/state_engine.py) ───────────
+# Resolve lib/ relative to this script (repo root or plugin cache root — both put bin/ and lib/
+# as siblings), so it works installed-as-plugin and from a clone alike.
+_engine() { python3 "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")/lib/state_engine.py" "$@"; }
+cmd_status() { command -v python3 >/dev/null || die "python3 not installed (needed for the state engine)"; _engine status "$@"; }
+
 usage() {
-  sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,47p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ──────────────────────────────────────────────────────────────────
@@ -574,6 +582,7 @@ main() {
     migrate)          cmd_migrate "$@" ;;
     restore)          cmd_restore "$@" ;;
     tidy)             cmd_tidy "$@" ;;
+    status|state)     cmd_status "$@" ;;
     install-timer)    cmd_install_timer "$@" ;;
     uninstall-timer)  cmd_uninstall_timer "$@" ;;
     ""|help|-h|--help) usage ;;

@@ -154,3 +154,97 @@ def decide(record):
             and record.get("status") == "idle" and derive_health(record) == "down":
         return "reissue-rc"
     return "none"                                  # incl. rc_health up/unknown, rc_desired False
+
+
+# ── impure shell: gather() reads the world and feeds strings to the pure core ────────────────
+import glob     # noqa: E402
+import os       # noqa: E402
+import subprocess  # noqa: E402
+
+
+def _run(*args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return ""
+
+
+def _state_files_by_uuid():
+    out = {}
+    for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+        try:
+            txt = open(f, encoding="utf-8").read()
+        except Exception:
+            continue
+        st = parse_state(txt)
+        if st["session_id"]:
+            out[st["session_id"]] = st
+    return out
+
+
+def _read_registry(tsv):
+    rows = []
+    try:
+        lines = open(tsv, encoding="utf-8").read().splitlines()
+    except Exception:
+        return rows
+    for ln in lines:
+        if not ln or ln.startswith("#"):
+            continue
+        parts = ln.split("\t")
+        if len(parts) < 2:
+            continue
+        parts += [""] * (5 - len(parts))
+        rows.append({"name": parts[0], "uuid": parts[1], "cwd_registered": parts[2],
+                     "effort": parts[3], "rc_desired": (parts[4] or "1") == "1"})
+    return rows
+
+
+def _pane_of(name):
+    for ln in _run("tmux", "list-panes", "-a", "-F", "#{session_name}\t#{pane_id}").splitlines():
+        if "\t" in ln:
+            s, pid = ln.split("\t", 1)
+            if s == name:
+                return pid
+    return None
+
+
+def gather():
+    """Read the registry + state files + tmux panes → one record per registered session."""
+    home = os.environ.get("CLAUDE_KEEP_HOME", os.path.expanduser("~/.claude-keep"))
+    states = _state_files_by_uuid()
+    records = []
+    for reg in _read_registry(os.path.join(home, "sessions.tsv")):
+        pane = _pane_of(reg["name"])
+        reg["pane_id"] = pane
+        if pane:
+            tui = parse_pane(_run("tmux", "capture-pane", "-p", "-J", "-t", pane, "-S", "-80"))
+        else:
+            tui = {"state": "at-prompt", "rc_footer": "none",
+                   "composer": "unknown", "banners": [], "last_gen": None}
+        state = states.get(reg["uuid"], parse_state(""))
+        records.append(merge(reg, pane is not None, state, tui))
+    return records
+
+
+def main(argv):
+    if argv[:1] == ["status"]:
+        print(json.dumps(gather(), indent=2, ensure_ascii=False))
+        return 0
+    if argv[:1] == ["decide-one"] and len(argv) >= 2:
+        uuid = argv[1]
+        logged_in = "--logged-out" not in argv
+        for r in gather():
+            if r["uuid"] == uuid:
+                r["logged_in"] = logged_in
+                print(decide(r))
+                return 0
+        print("none")
+        return 0
+    print("usage: state_engine.py status | decide-one <uuid> [--logged-out]")
+    return 2
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main(sys.argv[1:]))
