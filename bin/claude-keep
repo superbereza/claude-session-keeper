@@ -46,8 +46,9 @@
 #     ($KEEP_RESTORE_MEM_MIN MiB, default 400), leaving the rest for the next tick — so an
 #     OOM-driven mass restart can't pile N heavy `--resume` processes onto an already-tight box.
 #   - a cwd that's GONE (not merely unmounted) is detected as a RENAMED/moved folder when the
-#     session's transcript shows it now lives at a different, existing path: restore & doctor name
-#     that path and suggest `migrate`. Set KEEP_AUTO_MIGRATE_RENAMED=1 to auto-relocate instead.
+#     session's transcript shows it now lives at a different, existing path: restore AUTO-relocates
+#     (copies the transcript + repoints the registry, original kept) and resumes there — doctor names
+#     the path too. Opt out with KEEP_AUTO_MIGRATE_RENAMED=0 (then it only alerts + suggests migrate).
 #     A still-down mount (same missing path in the transcript) is left waiting, as before.
 
 set -uo pipefail
@@ -276,19 +277,22 @@ cmd_restore() {
       local moved=""
       command -v python3 >/dev/null && moved=$(_engine inferred-cwd "$uuid" "$cwd" 2>/dev/null || true)
       if [[ -n "$moved" ]]; then
-        if [[ "${KEEP_AUTO_MIGRATE_RENAMED:-}" == "1" ]]; then
-          # opt-in: relocate the transcript into the new cwd's project dir + repoint the registry,
-          # then fall THROUGH to launch from the new cwd (no `continue`).
+        if [[ "${KEEP_AUTO_MIGRATE_RENAMED:-1}" != "0" ]]; then
+          # DEFAULT: the transcript points at an existing, different, dominant folder → relocate the
+          # transcript into the new cwd's project dir + repoint the registry, then fall THROUGH to
+          # launch from the new cwd (no `continue`). Non-destructive: the original transcript is kept.
+          # Opt out with KEEP_AUTO_MIGRATE_RENAMED=0 to only alert.
           local pd tr tmp
           pd="$(_projdir_for "$moved")"; mkdir -p "$pd"
           tr="$(_find_transcript "$uuid")"; [[ -n "$tr" ]] && cp "$tr" "$pd/$uuid.jsonl"
           tmp=$(mktemp); awk -F'\t' -v OFS='\t' -v n="$name" -v c="$moved" '$1==n{$3=c}1' "$TSV" > "$tmp" && mv "$tmp" "$TSV"
+          notify "ℹ claude-keep: '$name' cwd was renamed ($cwd → $moved) — auto-relocated (transcript + registry) and resuming there. Original transcript kept."
           cwd="$moved"
           _g "  ↪ auto-migrated (renamed folder): $name → $moved"; echo
         else
           local rflag="$CLAUDE_KEEP_HOME/.renamed-$(printf '%s' "$name" | tr '/ ' '__')"
-          [[ -e "$rflag" ]] || { notify "⚠ claude-keep: '$name' cwd is gone ($cwd) — its transcript shows it moved to $moved. Fix: claude-keep migrate '$name' '$moved'  (or set KEEP_AUTO_MIGRATE_RENAMED=1 to auto-relocate)"; : > "$rflag"; }
-          _y "  … cwd gone, looks RENAMED → $moved: $name (run migrate, or KEEP_AUTO_MIGRATE_RENAMED=1)"; echo
+          [[ -e "$rflag" ]] || { notify "⚠ claude-keep: '$name' cwd is gone ($cwd) — its transcript shows it moved to $moved. Fix: claude-keep migrate '$name' '$moved'  (auto-relocate is off: KEEP_AUTO_MIGRATE_RENAMED=0)"; : > "$rflag"; }
+          _y "  … cwd gone, looks RENAMED → $moved: $name (auto-migrate off; run migrate)"; echo
           waiting=$((waiting+1)); continue
         fi
       else
