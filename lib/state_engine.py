@@ -106,6 +106,25 @@ def encode_cwd(path):
     return re.sub(r"[^A-Za-z0-9]", "-", path or "")
 
 
+def infer_target_cwd(recent_cwds, registered_cwd, dir_exists, min_hits=3):
+    """Infer where a session with a MISSING registered cwd actually lives now (a renamed/moved
+    folder). The transcript records `cwd` per entry, so when a folder is renamed mid-session its
+    later entries carry the NEW path. Pure: caller supplies the recent cwd values (newest window),
+    the registered cwd, and a `dir_exists(path)->bool` predicate.
+
+    Returns the dominant recent cwd that (a) EXISTS, (b) DIFFERS from the registered cwd, and (c)
+    occurs at least `min_hits` times (so a one-off `cd` isn't mistaken for a move) — else None.
+    The None case covers the other reason a cwd goes missing: a transient network mount (the recent
+    cwd is the SAME missing path, so nothing existing+different dominates) → caller keeps waiting."""
+    from collections import Counter
+    cand = Counter(c for c in recent_cwds
+                   if c and c != registered_cwd and dir_exists(c))
+    if not cand:
+        return None
+    target, hits = cand.most_common(1)[0]
+    return target if hits >= min_hits else None
+
+
 def merge(reg, live, state, tui):
     """Combine registry row + tmux liveness + state-file + TUI parse into one record.
 
@@ -262,6 +281,29 @@ def main(argv):
     if argv[:1] == ["status"]:
         print(json.dumps(gather(), indent=2, ensure_ascii=False))
         return 0
+    if argv[:1] == ["inferred-cwd"] and len(argv) >= 3:
+        # inferred-cwd <uuid> <registered_cwd> — for a MISSING registered cwd, print where the
+        # session's transcript says it moved to (a renamed folder), else nothing. Reads only the
+        # tail of the (possibly huge) jsonl for recent cwd values.
+        uuid, registered = argv[1], argv[2]
+        jsonl = None
+        for f in glob.glob(os.path.expanduser("~/.claude/projects/*/%s.jsonl" % uuid)):
+            jsonl = f
+            break
+        if not jsonl:
+            return 0
+        try:
+            with open(jsonl, "rb") as fh:
+                fh.seek(0, 2)
+                fh.seek(max(0, fh.tell() - 2_000_000))     # last ~2MB is plenty of recent entries
+                tail = fh.read().decode("utf-8", "replace")
+        except OSError:
+            return 0
+        recent = re.findall(r'"cwd":"([^"]*)"', tail)
+        target = infer_target_cwd(recent, registered, os.path.isdir)
+        if target:
+            print(target)
+        return 0
     if argv[:1] == ["decide-all"]:
         logged_in = "--logged-out" not in argv
         for r in gather():                       # one gather for the whole fleet
@@ -278,7 +320,8 @@ def main(argv):
                 return 0
         print("none")
         return 0
-    print("usage: state_engine.py status | decide-all [--logged-out] | decide-one <uuid> [--logged-out]")
+    print("usage: state_engine.py status | decide-all [--logged-out] | decide-one <uuid> [--logged-out] "
+          "| inferred-cwd <uuid> <registered_cwd>")
     return 2
 
 

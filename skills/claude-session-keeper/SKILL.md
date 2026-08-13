@@ -49,6 +49,14 @@ For each registered session that isn't currently live:
 
 - **cwd not reachable** (e.g. a network mount isn't up yet) → **skipped**, retried next tick.
   `claude-keep` knows nothing about mounts — keep mounts healthy with their own keeper.
+- **cwd GONE because the folder was renamed/moved** → detected, not silently skipped forever. A
+  session records its `cwd` in every transcript entry, so a mid-session rename leaves the **new**
+  path in its recent entries. When the registered cwd no longer exists but the transcript's
+  dominant recent cwd is a *different, existing* folder, `restore` (and `doctor`) name it and
+  alert: *"cwd gone; it moved to `<new>` → `claude-keep migrate '<session>' '<new>'`"*. Set
+  **`KEEP_AUTO_MIGRATE_RENAMED=1`** to auto-relocate (copy the transcript + repoint the registry)
+  instead of alerting. A still-down mount is distinguished (its recent cwd is the *same* missing
+  path, so nothing existing-and-different dominates) and just keeps waiting, as before.
 - otherwise → `tmux new-session … claude --resume <uuid> [--effort <e>]`, then it:
   - answers the **"Resume session?"** dialog with **option 2 (full)** — never a lossy summary;
   - re-issues **`/remote-control <title>`** (unless `--no-rc`) and auto-confirms the prompt.

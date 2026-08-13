@@ -45,6 +45,10 @@
 #   - restore paces its relaunches and STOPS if free memory drops below a floor
 #     ($KEEP_RESTORE_MEM_MIN MiB, default 400), leaving the rest for the next tick — so an
 #     OOM-driven mass restart can't pile N heavy `--resume` processes onto an already-tight box.
+#   - a cwd that's GONE (not merely unmounted) is detected as a RENAMED/moved folder when the
+#     session's transcript shows it now lives at a different, existing path: restore & doctor name
+#     that path and suggest `migrate`. Set KEEP_AUTO_MIGRATE_RENAMED=1 to auto-relocate instead.
+#     A still-down mount (same missing path in the transcript) is left waiting, as before.
 
 set -uo pipefail
 
@@ -264,10 +268,33 @@ cmd_restore() {
     if tmux has-session -t "=$name" 2>/dev/null; then
       skipped=$((skipped+1)); continue
     fi
-    # cwd not ready (e.g. a network mount still down) → leave for the next tick
+    # cwd not ready → distinguish a TRANSIENT missing mount (keep waiting) from a RENAMED/moved
+    # folder. The transcript records `cwd` per entry, so a rename leaves the NEW path in its recent
+    # entries — `_engine inferred-cwd` returns it (only if it exists AND dominates AND differs, so a
+    # still-down mount, whose recent cwd is the same missing path, returns nothing → we just wait).
     if [[ ! -d "$cwd" ]] || ! timeout 8 ls "$cwd" >/dev/null 2>&1; then
-      _y "  … waiting on cwd: $name ($cwd)"; echo
-      waiting=$((waiting+1)); continue
+      local moved=""
+      command -v python3 >/dev/null && moved=$(_engine inferred-cwd "$uuid" "$cwd" 2>/dev/null || true)
+      if [[ -n "$moved" ]]; then
+        if [[ "${KEEP_AUTO_MIGRATE_RENAMED:-}" == "1" ]]; then
+          # opt-in: relocate the transcript into the new cwd's project dir + repoint the registry,
+          # then fall THROUGH to launch from the new cwd (no `continue`).
+          local pd tr tmp
+          pd="$(_projdir_for "$moved")"; mkdir -p "$pd"
+          tr="$(_find_transcript "$uuid")"; [[ -n "$tr" ]] && cp "$tr" "$pd/$uuid.jsonl"
+          tmp=$(mktemp); awk -F'\t' -v OFS='\t' -v n="$name" -v c="$moved" '$1==n{$3=c}1' "$TSV" > "$tmp" && mv "$tmp" "$TSV"
+          cwd="$moved"
+          _g "  ↪ auto-migrated (renamed folder): $name → $moved"; echo
+        else
+          local rflag="$CLAUDE_KEEP_HOME/.renamed-$(printf '%s' "$name" | tr '/ ' '__')"
+          [[ -e "$rflag" ]] || { notify "⚠ claude-keep: '$name' cwd is gone ($cwd) — its transcript shows it moved to $moved. Fix: claude-keep migrate '$name' '$moved'  (or set KEEP_AUTO_MIGRATE_RENAMED=1 to auto-relocate)"; : > "$rflag"; }
+          _y "  … cwd gone, looks RENAMED → $moved: $name (run migrate, or KEEP_AUTO_MIGRATE_RENAMED=1)"; echo
+          waiting=$((waiting+1)); continue
+        fi
+      else
+        _y "  … waiting on cwd: $name ($cwd)"; echo
+        waiting=$((waiting+1)); continue
+      fi
     fi
 
     # The transcript must sit in THIS cwd's project dir or `--resume` dies instantly
@@ -498,7 +525,13 @@ cmd_doctor() {
     local found
     if [[ -f "$(_projdir_for "$cwd")/$uuid.jsonl" ]]; then
       if [[ -d "$cwd" ]]; then ok=$((ok+1)); continue; fi
-      deadcwd=$((deadcwd+1)); _y "  DEAD-CWD"; echo "  $title — cwd gone ($cwd) → migrate to a live cwd"
+      deadcwd=$((deadcwd+1)); _y "  DEAD-CWD"
+      local moved=""; command -v python3 >/dev/null && moved=$(_engine inferred-cwd "$uuid" "$cwd" 2>/dev/null || true)
+      if [[ -n "$moved" ]]; then
+        echo "  $title — cwd gone ($cwd); transcript shows it moved to $moved → claude-keep migrate '$ROW_NAME' '$moved'"
+      else
+        echo "  $title — cwd gone ($cwd) → migrate to a live cwd"
+      fi
       continue
     fi
     found="$(_find_transcript "$uuid")"
@@ -552,7 +585,7 @@ _engine() { python3 "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 cmd_status() { command -v python3 >/dev/null || die "python3 not installed (needed for the state engine)"; _engine status "$@"; }
 
 usage() {
-  sed -n '2,47p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,51p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ──────────────────────────────────────────────────────────────────

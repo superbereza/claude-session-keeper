@@ -1,6 +1,6 @@
 import unittest
 
-from lib.state_engine import merge, encode_cwd
+from lib.state_engine import merge, encode_cwd, infer_target_cwd
 
 REG = {"name": "cc—x/proj", "uuid": "u1", "cwd_registered": "/home/me/dev/proj",
        "effort": "", "rc_desired": True, "pane_id": "%3"}
@@ -46,6 +46,30 @@ class TestEncodeCwd(unittest.TestCase):
     def test_worktree_path_encoding(self):
         self.assertEqual(encode_cwd("/home/me/dev/proj/.claude/worktrees/x"),
                          "-home-me-dev-proj--claude-worktrees-x")   # '.' → '-', so '/.claude' → '--claude'
+
+
+class TestInferTargetCwd(unittest.TestCase):
+    OLD = "/home/me/dev/mass-server-infrastructure"   # renamed away — no longer exists
+    NEW = "/home/me/dev/massonde"                      # exists
+
+    def exists(self, only):
+        return lambda p: p in only
+
+    def test_renamed_folder_infers_new_dominant_cwd(self):
+        recent = [self.OLD] * 4 + [self.NEW] * 20        # session moved; NEW dominates recent
+        self.assertEqual(infer_target_cwd(recent, self.OLD, self.exists({self.NEW})), self.NEW)
+
+    def test_transient_mount_same_missing_path_returns_none(self):
+        recent = [self.OLD] * 20                          # cwd unchanged, just not mounted
+        self.assertIsNone(infer_target_cwd(recent, self.OLD, self.exists(set())))
+
+    def test_one_off_cd_below_threshold_returns_none(self):
+        recent = [self.OLD] * 20 + [self.NEW] * 2         # a stray cd, not a move
+        self.assertIsNone(infer_target_cwd(recent, self.OLD, self.exists({self.NEW})))
+
+    def test_target_must_exist(self):
+        recent = [self.NEW] * 20                          # dominant but the dir doesn't exist
+        self.assertIsNone(infer_target_cwd(recent, self.OLD, self.exists(set())))
 
 
 if __name__ == "__main__":
