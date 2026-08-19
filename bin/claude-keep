@@ -20,6 +20,9 @@
 #                                      deliberately moves a session's working dir. Original kept as backup.
 #   claude-keep restore                        Re-launch every registered session that isn't live, then
 #                                      tidy the live ones. (Auto-heals a drifted transcript; skips a lost one.)
+#   claude-keep pause <session…>               Archive session(s): kill the tmux (if live) but KEEP the
+#                                      registry row; restore/tidy skip it until you resume. Names as for send.
+#   claude-keep resume <session…>              Un-pause — restore will bring it back (run restore, or wait).
 #   claude-keep tidy                           Tidy LIVE sessions only (no relaunch): clear a stuck "Resume
 #                                      session?" dialog (option 2 = full) or a stuck Remote Control panel,
 #                                      RE-ESTABLISH Remote Control when its bridge is genuinely absent (read
@@ -31,9 +34,11 @@
 #   claude-keep uninstall-timer                Remove the restore timer.
 #
 # Registry: ${CLAUDE_KEEP_HOME:-~/.claude-keep}/sessions.tsv
-#   columns: tmux_name <TAB> uuid <TAB> cwd <TAB> effort <TAB> rc
+#   columns: tmux_name <TAB> uuid <TAB> cwd <TAB> effort <TAB> rc [<TAB> paused]
 #   rc=1 → re-issue /remote-control after resume (these are Remote Control sessions);
 #   rc=0 → plain tmux session, no Remote Control.
+#   paused=1 → archived: kept in the registry but restore/tidy skip it (pause/resume). Optional
+#             6th column; absent = active (0).
 #
 # Notes:
 #   - model is NOT stored: `claude --resume <uuid>` restores the session's own model.
@@ -117,7 +122,7 @@ ensure_registry() {
   if [[ ! -f "$TSV" ]]; then
     {
       echo "# claude-session-keeper registry"
-      echo "# tmux_name<TAB>uuid<TAB>cwd<TAB>effort<TAB>rc   (rc=1 → re-enable Remote Control)"
+      echo "# tmux_name<TAB>uuid<TAB>cwd<TAB>effort<TAB>rc[<TAB>paused]   (rc=1 → re-enable RC; paused=1 → archived)"
     } > "$TSV"
   fi
 }
@@ -196,7 +201,11 @@ _split_row() {
   ROW_UUID="${rest%%$'\t'*}";   rest="${rest#*$'\t'}"
   ROW_CWD="${rest%%$'\t'*}";    rest="${rest#*$'\t'}"
   ROW_EFFORT="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
-  ROW_RC="$rest"
+  ROW_RC="${rest%%$'\t'*}"
+  # optional 6th column: paused (1 = archived — kept in the registry, skipped by restore).
+  # Backward-compatible: a 5-field row (no tab left after rc) → paused=0.
+  if [[ "$rest" == *$'\t'* ]]; then ROW_PAUSED="${rest#*$'\t'}"; else ROW_PAUSED="0"; fi
+  ROW_PAUSED="${ROW_PAUSED:-0}"
 }
 
 # ──────────────────────────────────────────────────────────────────
@@ -204,24 +213,84 @@ cmd_ls() {
   ensure_registry
   printf "  %-46s  %-5s  %-8s  %-7s  %s\n" "tmux session" "live" "effort" "rc" "cwd"
   printf "  %-46s  %-5s  %-8s  %-7s  %s\n" "$(printf '%.0s-' {1..46})" "-----" "--------" "-------" "----"
-  local n_total=0 n_live=0
+  local n_total=0 n_live=0 n_paused=0
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     [[ -z "$_line" || "${_line:0:1}" == "#" ]] && continue
     _split_row "$_line"
     local name="$ROW_NAME" uuid="$ROW_UUID" cwd="$ROW_CWD" effort="$ROW_EFFORT" rc="$ROW_RC"
     n_total=$((n_total+1))
     local live="✗"
-    if tmux has-session -t "=$name" 2>/dev/null; then live="✓"; n_live=$((n_live+1)); fi
+    if [[ "$ROW_PAUSED" == "1" ]]; then live="⏸"; n_paused=$((n_paused+1))
+    elif tmux has-session -t "=$name" 2>/dev/null; then live="✓"; n_live=$((n_live+1)); fi
     local cwd_mark="$cwd"
     [[ -d "$cwd" ]] || cwd_mark="$cwd  (missing)"
     printf "  %-46s  %-5s  %-8s  %-7s  %s\n" "$name" "$live" "${effort:-—}" "$([[ "${rc:-1}" == 1 ]] && echo yes || echo no)" "$cwd_mark"
   done < "$TSV"
   echo
-  echo "  $n_live/$n_total live   (registry: $TSV)"
+  local ptxt=""; (( n_paused > 0 )) && ptxt=" · $n_paused paused ⏸"
+  echo "  $n_live/$n_total live${ptxt}   (registry: $TSV)"
 }
 
 # ── drive a freshly-resumed pane: answer the resume dialog, re-enable RC ──
 # _drive_restore — after a fresh launch, bring the session to RC-active. Dialog
+# ── pause / resume (archive a tracked session) ────────────────────────────────
+# Keep a session in the registry but tell restore to leave it alone: `pause` kills its tmux
+# (if live) and flags paused=1; `resume` clears the flag so restore brings it back. The
+# session's transcript + registry row are untouched, so a paused session resumes right where
+# it left off whenever you un-pause it.
+
+# Resolve a user-given id to an exact registry tmux_name (a paused session may be dead, so we
+# match the REGISTRY, not tmux). Accepts full tmux name, chat title (no cc—), or a bare tail.
+_resolve_reg() {
+  local q="$1" n; local -a hits=()
+  local names; names=$(awk -F'\t' 'NF>=2 && $1!~/^#/{print $1}' "$TSV" 2>/dev/null)
+  [[ -n "$names" ]] || { echo "registry is empty" >&2; return 1; }
+  while IFS= read -r n; do [[ "$n" == "$q" ]]        && { printf '%s\n' "$n"; return 0; }; done <<< "$names"
+  while IFS= read -r n; do [[ "$n" == "cc${EM}$q" ]] && { printf '%s\n' "$n"; return 0; }; done <<< "$names"
+  while IFS= read -r n; do [[ "$n" == *"/$q" || "${n#cc${EM}}" == "$q" ]] && hits+=("$n"); done <<< "$names"
+  (( ${#hits[@]} == 1 )) && { printf '%s\n' "${hits[0]}"; return 0; }
+  (( ${#hits[@]} > 1 ))  && { { echo "ambiguous '$q' — matches:"; printf '  %s\n' "${hits[@]}"; echo "be more specific."; } >&2; return 2; }
+  echo "no registered session: $q" >&2; return 1
+}
+
+# set the 6th (paused) column of a registry row; awk auto-extends a 5-field row to 6.
+_set_paused() {
+  local name="$1" val="$2" tmp; tmp=$(mktemp)
+  awk -F'\t' -v OFS='\t' -v n="$name" -v p="$val" '
+    NF==0 || $1 ~ /^#/ { print; next }
+    $1==n { $6=p } { print }
+  ' "$TSV" > "$tmp" && mv "$tmp" "$TSV"
+}
+
+cmd_pause() {
+  ensure_registry
+  [[ $# -ge 1 ]] || die "pause: usage: claude-keep pause <session…>"
+  local q name
+  for q in "$@"; do
+    name=$(_resolve_reg "$q") || continue
+    _set_paused "$name" 1
+    if tmux has-session -t "=$name" 2>/dev/null; then
+      tmux kill-session -t "=$name" 2>/dev/null && _y "  ⏸ paused + killed: ${name#cc${EM}}" || _y "  ⏸ paused (kill failed): ${name#cc${EM}}"
+    else
+      _y "  ⏸ paused (was not live): ${name#cc${EM}}"
+    fi
+    echo
+  done
+  echo "  paused sessions stay in the registry; restore/tidy skip them. Un-pause: claude-keep resume <session>"
+}
+
+cmd_resume() {
+  ensure_registry
+  [[ $# -ge 1 ]] || die "resume: usage: claude-keep resume <session…>"
+  local q name
+  for q in "$@"; do
+    name=$(_resolve_reg "$q") || continue
+    _set_paused "$name" 0
+    _g "  ▶ resumed (un-paused): ${name#cc${EM}}"; echo
+  done
+  echo "  → run 'claude-keep restore' to bring them back now (or the timer will, within the interval)."
+}
+
 # handling (resume prompt, RC panel, Enable-RC confirm) is delegated to the shared
 # _tidy_pane; the one thing only THIS needs is issuing /remote-control on a fresh
 # session. Addresses the pane by %id (capture-pane -t "=<em-dash name>" returns empty).
@@ -259,12 +328,15 @@ cmd_restore() {
     _y "⚠ claude not logged in — sessions will start but API calls 401 until: $CLAUDE auth login"; echo
   fi
 
-  local launched=0 skipped=0 waiting=0
+  local launched=0 skipped=0 waiting=0 paused=0
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     [[ -z "$_line" || "${_line:0:1}" == "#" ]] && continue
     _split_row "$_line"
     local name="$ROW_NAME" uuid="$ROW_UUID" cwd="$ROW_CWD" effort="$ROW_EFFORT" rc="$ROW_RC"
     rc="${rc:-1}"
+
+    # paused (archived) → left in the registry, deliberately not relaunched. `resume` un-pauses.
+    [[ "$ROW_PAUSED" == "1" ]] && { paused=$((paused+1)); continue; }
 
     if tmux has-session -t "=$name" 2>/dev/null; then
       skipped=$((skipped+1)); continue
@@ -345,7 +417,7 @@ cmd_restore() {
   _do_tidy_sweep
 
   echo
-  echo "restore: launched=$launched, already-live=$skipped, waiting-on-cwd=$waiting (+ tidied live)"
+  echo "restore: launched=$launched, already-live=$skipped, waiting-on-cwd=$waiting, paused=$paused (+ tidied live)"
 }
 
 # ──────────────────────────────────────────────────────────────────
@@ -492,6 +564,7 @@ _do_tidy_sweep() {
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     [[ -z "$_line" || "${_line:0:1}" == "#" ]] && continue
     _split_row "$_line"; name="$ROW_NAME"; uuid="$ROW_UUID"; title="${name#cc${EM}}"
+    [[ "$ROW_PAUSED" == "1" ]] && continue        # archived → don't tidy / RC-heal
     tmux has-session -t "=$name" 2>/dev/null || continue
     pid=$(_pane_of "$name"); [[ -z "$pid" ]] && continue
 
@@ -589,7 +662,7 @@ _engine() { python3 "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 cmd_status() { command -v python3 >/dev/null || die "python3 not installed (needed for the state engine)"; _engine status "$@"; }
 
 usage() {
-  sed -n '2,51p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,57p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ──────────────────────────────────────────────────────────────────
@@ -602,6 +675,8 @@ main() {
     doctor|audit)     cmd_doctor "$@" ;;
     migrate)          cmd_migrate "$@" ;;
     restore)          cmd_restore "$@" ;;
+    pause|archive)    cmd_pause "$@" ;;
+    resume|unpause)   cmd_resume "$@" ;;
     tidy)             cmd_tidy "$@" ;;
     status|state)     cmd_status "$@" ;;
     install-timer)    cmd_install_timer "$@" ;;

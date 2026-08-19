@@ -143,6 +143,7 @@ def merge(reg, live, state, tui):
         "name": reg.get("name"), "uuid": reg.get("uuid"),
         "cwd_registered": cwd_reg, "effort": reg.get("effort", ""),
         "rc_desired": bool(reg.get("rc_desired")),
+        "paused": bool(reg.get("paused")),
         "live": bool(live), "pane_id": reg.get("pane_id"),
         "pid": state.get("pid"), "status": status,
         "rc_bridge": state.get("rc_bridge", "absent"),
@@ -186,6 +187,8 @@ def decide(record):
     would resume the STALE copy and lose work. Dead-session drift is healed inline by restore's
     relaunch. So decide surfaces drift in the record (for status/doctor) but never auto-migrates.
     """
+    if record.get("paused"):
+        return "none"                              # archived — deliberately left alone (pause/resume)
     if record.get("status") == "busy":
         return "none"                              # never interrupt a working session
     if not record.get("live"):
@@ -236,9 +239,10 @@ def _read_registry(tsv):
         parts = ln.split("\t")
         if len(parts) < 2:
             continue
-        parts += [""] * (5 - len(parts))
+        parts += [""] * (6 - len(parts))
         rows.append({"name": parts[0], "uuid": parts[1], "cwd_registered": parts[2],
-                     "effort": parts[3], "rc_desired": (parts[4] or "1") == "1"})
+                     "effort": parts[3], "rc_desired": (parts[4] or "1") == "1",
+                     "paused": parts[5] == "1"})
     return rows
 
 

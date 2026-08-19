@@ -6,7 +6,7 @@ from lib.state_engine import derive_health, decide
 def rec(**kw):
     base = {"live": True, "rc_desired": True, "status": "idle",
             "rc_bridge": "present", "rc_footer": "active", "dialog": "none",
-            "drift": False, "logged_in": True}
+            "drift": False, "logged_in": True, "paused": False}
     base.update(kw)
     return base
 
@@ -37,6 +37,11 @@ class TestDecide(unittest.TestCase):
 
     def test_dead_session_relaunched(self):
         self.assertEqual(decide(rec(live=False)), "relaunch")
+
+    def test_paused_is_left_alone_even_if_dead(self):
+        # archived: paused takes precedence over relaunch/RC-heal — restore must not resurrect it.
+        self.assertEqual(decide(rec(paused=True, live=False)), "none")
+        self.assertEqual(decide(rec(paused=True, rc_bridge="absent", status="idle")), "none")
 
     def test_live_drift_is_flag_only_not_migrate(self):
         # migrating a live session would copy a transcript it's still writing → later restore
